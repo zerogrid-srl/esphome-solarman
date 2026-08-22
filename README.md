@@ -14,6 +14,14 @@ in at runtime from the web UI instead of being hardcoded in YAML.
 > real map from your own inverter before trusting the sensor values. See
 > [Confirming the register map](#confirming-the-register-map).
 
+## Read-only by design
+
+This component only ever emits Modbus function code **0x03** (read holding
+registers). It contains no write function code (0x05 / 0x06 / 0x0F / 0x10) and
+no code path that could alter an inverter setting — it is safe to point at a
+live installation. The constant is named and commented in the source so that
+adding a write would have to be a deliberate change rather than an accident.
+
 ## Requirements
 
 - An **ESP32** (the component uses POSIX sockets; ESP8266 is not supported)

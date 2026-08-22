@@ -14,31 +14,53 @@ namespace solarman_minimal {
 
 static const char *const TAG = "solarman";
 
-// ── Register map – Deye SG series (adjust if firmware differs) ────────────
+// ── Register map – Deye hybrid (SUN-xK-SG0xLPx) ───────────────────────────
 //
-// Batch A  0x00B7..0x00BE  (8 regs)  Battery + PV power
-//   [0] 0x00B7 = Battery Voltage  ×0.1 V
+// Taken from the `deye_hybrid` profile of the ha-solarman integration, which
+// is in production use against a Deye 8K SG05LP1. Verified against that
+// project's own parser for the multi-register (32-bit) decoding order.
+//
+// Batch A  0x0060..0x0061  (2 regs)
+//   Total Production  ×0.1 kWh, 32-bit UNSIGNED.
+//   First register is the LOW word: value = reg[0] | (reg[1] << 16).
+//
+// Batch B  0x006C..0x006F  (4 regs)
+//   [0] 0x006C = Daily Production  ×0.1 kWh
+//   [1] 0x006D = PV1 Voltage       ×0.1 V
+//   [3] 0x006F = PV2 Voltage       ×0.1 V
+//
+// Batch C  0x00A9..0x00B2  (10 regs)
+//   [0] 0x00A9 = Grid Power  W  signed
+//   [9] 0x00B2 = Load Power  W  signed
+//
+// Batch D  0x00B7..0x00BE  (8 regs)
+//   [0] 0x00B7 = Battery Voltage  ×0.01 V
 //   [1] 0x00B8 = Battery SOC      %
 //   [3] 0x00BA = PV1 Power        W
 //   [4] 0x00BB = PV2 Power        W
-//   [7] 0x00BE = Battery Power    W  signed (+charge / -discharge)
+//   [7] 0x00BE = Battery Power    W  signed
 //
-// Batch B  0x006A..0x006D  (4 regs)  PV voltages
-//   [0] 0x006A = PV1 Voltage  ×0.1 V
-//   [2] 0x006C = PV2 Voltage  ×0.1 V
-//
-// Batch C  0x020E..0x0216  (9 regs)  Load / grid / yield
-//   [0] 0x020E = Load Power         W
-//   [3] 0x0211 = Daily Production   ×0.1 kWh
-//   [4] 0x0212 = Grid Power         W  signed (+import / -export)
-//   [8] 0x0216 = Total Production   ×0.1 kWh
-//
-static const uint16_t REG_BATT_VOLTAGE = 0x00B7;
-static const uint16_t REG_PV1_VOLTAGE  = 0x006A;
-static const uint16_t REG_LOAD_POWER   = 0x020E;
+// Two things the upstream profile leaves genuinely uncertain, both to settle
+// on real hardware rather than by guessing:
+//   * Grid and Load Power carry `scale: [1, 10, 10]` with the comment
+//     "out of date docs". Raw watts (scale 1) is used here; if the readings
+//     come out 10x off, that is the reason.
+//   * Grid Power additionally carries an `inverse` attribute upstream, so the
+//     sign convention below (+ import / - export) may be the other way round.
+static const uint16_t REG_TOTAL_PRODUCTION = 0x0060;
+static const uint16_t REG_DAILY_PRODUCTION = 0x006C;
+static const uint16_t REG_GRID_POWER       = 0x00A9;
+static const uint16_t REG_BATT_VOLTAGE     = 0x00B7;
 
 // Fixed NVS key for the serial preference (independent of the serial value)
 static const uint32_t SERIAL_PREFS_KEY = 0x534C4D41;  // "SLMA"
+
+// READ-ONLY BY DESIGN. This is the only Modbus function code this component
+// ever emits, and it is a read. Nothing here can alter inverter settings,
+// which matters because it runs against live customer installations.
+// Introducing a write function code (0x05/0x06/0x0F/0x10) would break that
+// guarantee and must be a deliberate, reviewed decision — not a side effect.
+static const uint8_t MODBUS_FC_READ_HOLDING_REGISTERS = 0x03;
 
 // ── setup ─────────────────────────────────────────────────────────────────
 
@@ -132,9 +154,11 @@ void SolarmanMinimal::update() {
     return;
   }
 
-  // ── Batch A: battery + PV power ─────────────────────────────────────────
-  std::vector<uint16_t> a;
-  if (!read_registers(REG_BATT_VOLTAGE, 8, a)) {
+  // ── Batch D first: battery + PV power ───────────────────────────────────
+  // Read first because it drives the failure counter — if the inverter is
+  // unreachable there is no point attempting the other three batches.
+  std::vector<uint16_t> d;
+  if (!read_registers(REG_BATT_VOLTAGE, 8, d)) {
     consecutive_failures_++;
     ESP_LOGW(TAG, "Read failed (%u/%u)", consecutive_failures_, MAX_FAILURES);
     if (consecutive_failures_ >= MAX_FAILURES && !host_override_) {
@@ -145,26 +169,34 @@ void SolarmanMinimal::update() {
     return;
   }
   consecutive_failures_ = 0;
-  if (battery_voltage_) battery_voltage_->publish_state(a[0] * 0.1f);
-  if (battery_soc_)     battery_soc_->publish_state(a[1]);
-  if (pv1_power_)       pv1_power_->publish_state(a[3]);
-  if (pv2_power_)       pv2_power_->publish_state(a[4]);
-  if (battery_power_)   publish_signed(battery_power_, a[7]);
+  if (battery_voltage_) battery_voltage_->publish_state(d[0] * 0.01f);
+  if (battery_soc_)     battery_soc_->publish_state(d[1]);
+  if (pv1_power_)       pv1_power_->publish_state(d[3]);
+  if (pv2_power_)       pv2_power_->publish_state(d[4]);
+  if (battery_power_)   publish_signed(battery_power_, d[7]);
 
-  // ── Batch B: PV voltages ────────────────────────────────────────────────
+  // ── Batch B: daily yield + PV voltages ──────────────────────────────────
   std::vector<uint16_t> b;
-  if (read_registers(REG_PV1_VOLTAGE, 4, b)) {
-    if (pv1_voltage_) pv1_voltage_->publish_state(b[0] * 0.1f);
-    if (pv2_voltage_) pv2_voltage_->publish_state(b[2] * 0.1f);
+  if (read_registers(REG_DAILY_PRODUCTION, 4, b)) {
+    if (daily_production_) daily_production_->publish_state(b[0] * 0.1f);
+    if (pv1_voltage_)      pv1_voltage_->publish_state(b[1] * 0.1f);
+    if (pv2_voltage_)      pv2_voltage_->publish_state(b[3] * 0.1f);
   }
 
-  // ── Batch C: load / grid / yield ────────────────────────────────────────
+  // ── Batch C: grid + load power ──────────────────────────────────────────
   std::vector<uint16_t> c;
-  if (read_registers(REG_LOAD_POWER, 9, c)) {
-    if (load_power_)       load_power_->publish_state(c[0]);
-    if (daily_production_) daily_production_->publish_state(c[3] * 0.1f);
-    if (grid_power_)       publish_signed(grid_power_, c[4]);
-    if (total_production_) total_production_->publish_state(c[8] * 0.1f);
+  if (read_registers(REG_GRID_POWER, 10, c)) {
+    if (grid_power_) publish_signed(grid_power_, c[0]);
+    if (load_power_) publish_signed(load_power_, c[9]);
+  }
+
+  // ── Batch A: total production (32-bit, low word first) ──────────────────
+  if (total_production_) {
+    std::vector<uint16_t> a;
+    if (read_registers(REG_TOTAL_PRODUCTION, 2, a)) {
+      uint32_t raw = (uint32_t) a[0] | ((uint32_t) a[1] << 16);
+      total_production_->publish_state(raw * 0.1f);
+    }
   }
 }
 
@@ -189,23 +221,19 @@ void SolarmanMinimal::scan_registers() {
     uint8_t count;
     const char *label;
   };
-  // Two families are covered on purpose. The low block (0x003B..0x00E0) matches
-  // the older/3-phase layout the defaults above were taken from; the 0x0244+
-  // block is where single-phase hybrids (SUN-xK-SG05LP1) actually keep battery,
-  // PV, grid and load. Scanning both means one visit settles the map either way.
+  // The first four ranges cover the whole verified deye_hybrid map, so a scan
+  // confirms every sensor this component publishes. The rest are a wider sweep
+  // for other Deye variants whose layout differs.
   static const Range ranges[] = {
       {0x003B, 10, "Time / status"},
-      {0x0056, 16, "Grid + phase data"},
-      {0x006A, 10, "PV voltage / current (low block)"},
-      {0x00B0, 20, "Battery + PV power (low block)"},
+      {0x005C, 12, "Energy totals (incl. 0x0060 total production)"},
+      {0x0068, 12, "Daily yield + PV voltage / current"},
+      {0x00A5, 28, "Grid power, load power, battery, PV power"},
+      {0x00C0, 16, "Battery / temperature extras"},
       {0x00E0, 16, "Grid meter"},
-      {0x0202, 24, "Daily / total energy"},
-      {0x021A, 20, "Energy block B"},
-      {0x0244, 20, "HYBRID: batt temp/volt/SOC, PV power, batt power"},
-      {0x0258, 20, "HYBRID: grid power"},
-      {0x026C, 20, "HYBRID: load power"},
-      {0x0280, 20, "HYBRID: load / misc"},
-      {0x02A4, 16, "HYBRID: PV voltage / current"},
+      {0x0202, 24, "Alternative layout: energy"},
+      {0x0244, 20, "Alternative layout: battery / PV"},
+      {0x0258, 24, "Alternative layout: grid / load"},
   };
 
   ESP_LOGI(TAG, "===== REGISTER SCAN START =====");
@@ -385,10 +413,11 @@ bool SolarmanMinimal::read_registers(uint16_t start, uint8_t count, std::vector<
 //  [0x15]                      end
 
 std::vector<uint8_t> SolarmanMinimal::build_v5_request(uint16_t reg_start, uint8_t reg_count) {
-  // Modbus RTU: FC03 read holding registers
+  // Modbus RTU: read holding registers. See MODBUS_FC_READ_HOLDING_REGISTERS —
+  // this component never writes to the inverter.
   uint8_t mb[8] = {
       0x01,
-      0x03,
+      MODBUS_FC_READ_HOLDING_REGISTERS,
       (uint8_t) ((reg_start >> 8) & 0xFF),
       (uint8_t) (reg_start & 0xFF),
       0x00,
