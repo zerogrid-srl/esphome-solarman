@@ -1,0 +1,85 @@
+# Minimal working example — flash on any ESP32 on the same LAN as the
+# inverter's WiFi logger stick, then open http://solarman-example.local and
+# type the logger serial into "Logger Serial".
+#
+# Validate with:  esphome config example.yaml
+
+esphome:
+  name: solarman-example
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+external_components:
+  # In your own config, use the published tag instead:
+  #   - source: github://zerogrid-srl/esphome-solarman@v0.1.0
+  #     components: [solarman_minimal]
+  - source:
+      type: local
+      path: components
+    components: [solarman_minimal]
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Solarman Setup"
+    password: "solarman123"
+
+captive_portal:
+
+# DEBUG is required to read the register scan output
+logger:
+  level: DEBUG
+
+# No api: on purpose — with a web_server and no API client the board would
+# reboot every 15 minutes and interrupt a scan.
+web_server:
+  port: 80
+  version: 3
+  log: true
+
+ota:
+  - platform: esphome
+
+solarman_minimal:
+  id: solarman
+  update_interval: 30s
+
+  battery_soc:
+    name: "Battery SOC"
+  battery_voltage:
+    name: "Battery voltage"
+  battery_power:
+    name: "Battery power"
+  pv1_power:
+    name: "PV1 power"
+  pv2_power:
+    name: "PV2 power"
+  grid_power:
+    name: "Grid power"
+  load_power:
+    name: "Load power"
+  daily_production:
+    name: "Daily production"
+  total_production:
+    name: "Total production"
+
+text:
+  - platform: template
+    name: "Logger Serial"
+    id: logger_serial
+    mode: text
+    restore_value: true
+    optimistic: true
+    initial_value: ""
+    on_value:
+      - lambda: id(solarman).set_serial_from_text(x);
+
+button:
+  - platform: template
+    name: "Scan Registers"
+    on_press:
+      - lambda: id(solarman).scan_registers();

@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.esphome/
+
+# Never commit credentials — example.yaml needs a local secrets.yaml to validate
+secrets.yaml
