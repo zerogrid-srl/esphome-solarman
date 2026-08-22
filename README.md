@@ -8,10 +8,16 @@ The logger's IP is found automatically by UDP broadcast, so the only thing a
 user has to supply is the **logger serial number** — and even that can be typed
 in at runtime from the web UI instead of being hardcoded in YAML.
 
-> **Status: the register map is not yet confirmed.** The addresses below are the
-> commonly documented ones for the Deye SG series, but they have not been
-> verified against real hardware. Use the `scan_registers()` action to dump the
-> real map from your own inverter before trusting the sensor values. See
+> **Status: confirmed on a Deye 8K SG05LP1** (2026-08-22). Every sensor below
+> was read from a live installation and cross-checked for internal consistency:
+> scaling, the 32-bit word order of the energy totals, and the battery power
+> sign all come from measured values rather than documentation.
+>
+> **One thing is still open**: the Grid Power sign convention. It read 0 W for
+> the whole test, so the direction could not be observed.
+>
+> Other Deye models place these values at different addresses. On unfamiliar
+> hardware, run `scan_registers()` first — see
 > [Confirming the register map](#confirming-the-register-map).
 
 ## Read-only by design
@@ -51,9 +57,9 @@ solarman_minimal:
   battery_soc:
     name: "Battery SOC"
   battery_power:
-    name: "Battery power"       # signed: + charging, - discharging
+    name: "Battery power"       # signed: + discharging, - charging
   grid_power:
-    name: "Grid power"          # signed: + import, - export
+    name: "Grid power"          # signed; direction not yet confirmed
   load_power:
     name: "Load power"
   pv1_power:

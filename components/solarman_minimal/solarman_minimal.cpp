@@ -20,37 +20,45 @@ static const char *const TAG = "solarman";
 // is in production use against a Deye 8K SG05LP1. Verified against that
 // project's own parser for the multi-register (32-bit) decoding order.
 //
-// Batch A  0x0060..0x0061  (2 regs)
-//   Total Production  ×0.1 kWh, 32-bit UNSIGNED.
-//   First register is the LOW word: value = reg[0] | (reg[1] << 16).
+// Read in TWO batches rather than one connection per quantity. update() runs on
+// the main loop, and four sequential TCP round-trips measured 1427 ms on real
+// hardware — long enough for ESPHome to warn, and long enough to disturb a BLE
+// stack sharing the same device.
 //
-// Batch B  0x006C..0x006F  (4 regs)
-//   [0] 0x006C = Daily Production  ×0.1 kWh
-//   [1] 0x006D = PV1 Voltage       ×0.1 V
-//   [3] 0x006F = PV2 Voltage       ×0.1 V
+// Batch 1  0x0060..0x006F  (16 regs)
+//   [0]+[1] 0x0060/0x0061 = Total Production  ×0.1 kWh, 32-bit UNSIGNED,
+//                           first register is the LOW word.
+//   [12]    0x006C         = Daily Production  ×0.1 kWh
+//   [13]    0x006D         = PV1 Voltage       ×0.1 V
+//   [15]    0x006F         = PV2 Voltage       ×0.1 V
 //
-// Batch C  0x00A9..0x00B2  (10 regs)
-//   [0] 0x00A9 = Grid Power  W  signed
-//   [9] 0x00B2 = Load Power  W  signed
+// Batch 2  0x00A9..0x00BE  (22 regs)
+//   [0]  0x00A9 = Grid Power      W  signed
+//   [9]  0x00B2 = Load Power      W  signed
+//   [14] 0x00B7 = Battery Voltage ×0.01 V
+//   [15] 0x00B8 = Battery SOC     %
+//   [17] 0x00BA = PV1 Power       W
+//   [18] 0x00BB = PV2 Power       W
+//   [21] 0x00BE = Battery Power   W  signed, POSITIVE = DISCHARGING
 //
-// Batch D  0x00B7..0x00BE  (8 regs)
-//   [0] 0x00B7 = Battery Voltage  ×0.01 V
-//   [1] 0x00B8 = Battery SOC      %
-//   [3] 0x00BA = PV1 Power        W
-//   [4] 0x00BB = PV2 Power        W
-//   [7] 0x00BE = Battery Power    W  signed
+// Confirmed against a Deye 8K SG05LP1 on 2026-08-22:
+//   * Battery voltage scale 0.01 (read 52.3 V on a 48 V bank).
+//   * Grid/Load power scale is 1, not the 10 the upstream profile's
+//     `scale: [1, 10, 10]` hints at — 2705 W of load on an 8 kW inverter.
+//   * 32-bit word order (760.5 kWh total; reversed would read in the millions).
+//   * Battery power sign: at 19:39 with PV at 2 W, grid at 0 W and load at
+//     2705 W, the battery must have been discharging, and the register read
+//     +2813 W. The 108 W difference is inverter self-consumption. So a
+//     positive value means DISCHARGE — the opposite of what was documented
+//     here before.
 //
-// Two things the upstream profile leaves genuinely uncertain, both to settle
-// on real hardware rather than by guessing:
-//   * Grid and Load Power carry `scale: [1, 10, 10]` with the comment
-//     "out of date docs". Raw watts (scale 1) is used here; if the readings
-//     come out 10x off, that is the reason.
-//   * Grid Power additionally carries an `inverse` attribute upstream, so the
-//     sign convention below (+ import / - export) may be the other way round.
-static const uint16_t REG_TOTAL_PRODUCTION = 0x0060;
-static const uint16_t REG_DAILY_PRODUCTION = 0x006C;
-static const uint16_t REG_GRID_POWER       = 0x00A9;
-static const uint16_t REG_BATT_VOLTAGE     = 0x00B7;
+// Still open: the Grid Power sign convention. It read 0 W during the test, so
+// nothing could be inferred. Reading the upstream source does not settle it
+// either — the profile marks the sensor `attributes: [inverse]` while the
+// parser tests a differently-named key, `inverted`. To be settled by comparing
+// against a working integration during grid import or export.
+static const uint16_t REG_BATCH1_START = 0x0060;
+static const uint16_t REG_BATCH2_START = 0x00A9;
 
 // Fixed NVS key for the serial preference (independent of the serial value)
 static const uint32_t SERIAL_PREFS_KEY = 0x534C4D41;  // "SLMA"
@@ -154,11 +162,11 @@ void SolarmanMinimal::update() {
     return;
   }
 
-  // ── Batch D first: battery + PV power ───────────────────────────────────
-  // Read first because it drives the failure counter — if the inverter is
-  // unreachable there is no point attempting the other three batches.
-  std::vector<uint16_t> d;
-  if (!read_registers(REG_BATT_VOLTAGE, 8, d)) {
+  // ── Batch 2 first: grid, load, battery, PV power ────────────────────────
+  // Read first because it drives the failure counter and carries the values
+  // that matter most; if the inverter is unreachable, skip the rest.
+  std::vector<uint16_t> b2;
+  if (!read_registers(REG_BATCH2_START, 22, b2)) {
     consecutive_failures_++;
     ESP_LOGW(TAG, "Read failed (%u/%u)", consecutive_failures_, MAX_FAILURES);
     if (consecutive_failures_ >= MAX_FAILURES && !host_override_) {
@@ -169,34 +177,24 @@ void SolarmanMinimal::update() {
     return;
   }
   consecutive_failures_ = 0;
-  if (battery_voltage_) battery_voltage_->publish_state(d[0] * 0.01f);
-  if (battery_soc_)     battery_soc_->publish_state(d[1]);
-  if (pv1_power_)       pv1_power_->publish_state(d[3]);
-  if (pv2_power_)       pv2_power_->publish_state(d[4]);
-  if (battery_power_)   publish_signed(battery_power_, d[7]);
+  if (grid_power_)      publish_signed(grid_power_, b2[0]);
+  if (load_power_)      publish_signed(load_power_, b2[9]);
+  if (battery_voltage_) battery_voltage_->publish_state(b2[14] * 0.01f);
+  if (battery_soc_)     battery_soc_->publish_state(b2[15]);
+  if (pv1_power_)       pv1_power_->publish_state(b2[17]);
+  if (pv2_power_)       pv2_power_->publish_state(b2[18]);
+  if (battery_power_)   publish_signed(battery_power_, b2[21]);
 
-  // ── Batch B: daily yield + PV voltages ──────────────────────────────────
-  std::vector<uint16_t> b;
-  if (read_registers(REG_DAILY_PRODUCTION, 4, b)) {
-    if (daily_production_) daily_production_->publish_state(b[0] * 0.1f);
-    if (pv1_voltage_)      pv1_voltage_->publish_state(b[1] * 0.1f);
-    if (pv2_voltage_)      pv2_voltage_->publish_state(b[3] * 0.1f);
-  }
-
-  // ── Batch C: grid + load power ──────────────────────────────────────────
-  std::vector<uint16_t> c;
-  if (read_registers(REG_GRID_POWER, 10, c)) {
-    if (grid_power_) publish_signed(grid_power_, c[0]);
-    if (load_power_) publish_signed(load_power_, c[9]);
-  }
-
-  // ── Batch A: total production (32-bit, low word first) ──────────────────
-  if (total_production_) {
-    std::vector<uint16_t> a;
-    if (read_registers(REG_TOTAL_PRODUCTION, 2, a)) {
-      uint32_t raw = (uint32_t) a[0] | ((uint32_t) a[1] << 16);
+  // ── Batch 1: energy totals + PV voltages ────────────────────────────────
+  std::vector<uint16_t> b1;
+  if (read_registers(REG_BATCH1_START, 16, b1)) {
+    if (total_production_) {
+      uint32_t raw = (uint32_t) b1[0] | ((uint32_t) b1[1] << 16);
       total_production_->publish_state(raw * 0.1f);
     }
+    if (daily_production_) daily_production_->publish_state(b1[12] * 0.1f);
+    if (pv1_voltage_)      pv1_voltage_->publish_state(b1[13] * 0.1f);
+    if (pv2_voltage_)      pv2_voltage_->publish_state(b1[15] * 0.1f);
   }
 }
 

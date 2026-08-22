@@ -79,14 +79,18 @@ CONFIG_SCHEMA = cv.Schema(
             device_class=DEVICE_CLASS_VOLTAGE,
             state_class=STATE_CLASS_MEASUREMENT,
         ),
-        # Signed: positive = charging, negative = discharging
+        # Signed. Positive = DISCHARGING, confirmed on a Deye 8K SG05LP1:
+        # with PV at 2 W, grid at 0 W and load at 2705 W the register read
+        # +2813 W, so a positive value is power leaving the battery.
         cv.Optional(CONF_BATTERY_POWER): sensor.sensor_schema(
             unit_of_measurement=UNIT_WATT,
             accuracy_decimals=0,
             device_class=DEVICE_CLASS_POWER,
             state_class=STATE_CLASS_MEASUREMENT,
         ),
-        # Signed: positive = import from grid, negative = export to grid
+        # Signed, but the direction convention is NOT yet confirmed — it read
+        # 0 W throughout the only field test so far. Verify against a known
+        # reference during grid import or export before trusting the sign.
         cv.Optional(CONF_GRID_POWER): sensor.sensor_schema(
             unit_of_measurement=UNIT_WATT,
             accuracy_decimals=0,
