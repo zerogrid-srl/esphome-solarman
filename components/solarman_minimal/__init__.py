@@ -16,6 +16,11 @@ from esphome.const import (
 )
 
 DEPENDENCIES = ["wifi"]
+# This component creates sensors itself rather than being a sensor platform, so
+# nothing else guarantees the sensor component gets pulled into the build. A
+# config whose only sensors come from here fails to compile without this, with
+# a misleading "esphome/components/sensor/sensor.h: No such file or directory".
+AUTO_LOAD = ["sensor"]
 
 solarman_minimal_ns = cg.esphome_ns.namespace("solarman_minimal")
 SolarmanMinimal = solarman_minimal_ns.class_("SolarmanMinimal", cg.PollingComponent)
