@@ -10,6 +10,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <cinttypes>
 #include <cerrno>
 #include <cstring>
 #include <cstdlib>
@@ -102,7 +103,7 @@ void SolarmanMinimal::setup() {
     SolarmanSerialPrefs sp{};
     if (serial_prefs_.load(&sp) && sp.serial != 0) {
       serial_ = sp.serial;
-      ESP_LOGI(TAG, "Loaded serial %u from flash", serial_);
+      ESP_LOGI(TAG, "Loaded serial %" PRIu32 " from flash", serial_);
     } else {
       // Not an error: discovery will adopt a logger and its serial on the
       // first update. Typing one in only matters when several sticks share
@@ -117,14 +118,14 @@ void SolarmanMinimal::setup() {
     SolarmanPrefs saved{};
     if (prefs_.load(&saved) && (saved.ip[0] | saved.ip[1] | saved.ip[2] | saved.ip[3])) {
       memcpy(&host_addr_, saved.ip, 4);
-      ESP_LOGI(TAG, "Restored cached IP %s for serial %u", host_str().c_str(), serial_);
+      ESP_LOGI(TAG, "Restored cached IP %s for serial %" PRIu32, host_str().c_str(), serial_);
     }
   }
 }
 
 void SolarmanMinimal::dump_config() {
   ESP_LOGCONFIG(TAG, "Solarman:");
-  ESP_LOGCONFIG(TAG, "  Serial: %u", serial_);
+  ESP_LOGCONFIG(TAG, "  Serial: %" PRIu32, serial_);
   if (host_override_) {
     ESP_LOGCONFIG(TAG, "  Host: %s (manual)", host_str().c_str());
   } else if (has_host()) {
@@ -180,7 +181,7 @@ void SolarmanMinimal::set_serial_from_text(const std::string &s) {
   // Clear any cached IP so discovery runs fresh for the new serial
   if (!host_override_)
     host_addr_ = 0;
-  ESP_LOGI(TAG, "Serial set to %u - saved to flash", serial_);
+  ESP_LOGI(TAG, "Serial set to %" PRIu32 " - saved to flash", serial_);
 }
 
 // ── update ────────────────────────────────────────────────────────────────
@@ -193,9 +194,24 @@ void SolarmanMinimal::update() {
 
   // Discovery supplies whichever of the two is missing: the address, the
   // serial, or both. Nothing has to be configured for this to work.
-  if ((serial_ == 0 || !has_host()) && !discover_host()) {
-    ESP_LOGW(TAG, "Discovery failed - will retry next cycle");
-    return;
+  if (serial_ == 0 || !has_host()) {
+    // A failed attempt is not retried on the next poll. Discovery blocks the
+    // main loop while it waits, and repeating it every 10 s cost three seconds
+    // in ten on a device that also runs a BLE stack - for a probe that four
+    // sites in a row never answered.
+    uint32_t now = millis();
+    if (last_discovery_ms_ != 0 && (now - last_discovery_ms_) < DISCOVERY_RETRY) {
+      ESP_LOGD(TAG, "Discovery backing off - %u s to the next attempt",
+               (unsigned) ((DISCOVERY_RETRY - (now - last_discovery_ms_)) / 1000));
+      return;
+    }
+    last_discovery_ms_ = now;
+    if (!discover_host()) {
+      ESP_LOGW(TAG, "Discovery failed - next attempt in %u s",
+               (unsigned) (DISCOVERY_RETRY / 1000));
+      return;
+    }
+    last_discovery_ms_ = 0;
   }
 
   // ── Batch 2 first: grid, load, battery, PV power ────────────────────────
@@ -321,13 +337,40 @@ void SolarmanMinimal::scan_registers() {
 // with the serial it carries. That makes a zero-configuration deploy possible:
 // no IP, no serial, nothing to type in.
 
+// Our own address, then the /24 broadcast derived from it. connect() on a UDP
+// socket sends no packet: it only asks the stack which source address it would
+// use, which is the portable way to learn our IP without an ESPHome API that
+// differs between frameworks.
+uint32_t SolarmanMinimal::subnet_broadcast() {
+  int s = ::socket(AF_INET, SOCK_DGRAM, 0);
+  if (s < 0)
+    return 0;
+  struct sockaddr_in peer {};
+  peer.sin_family = AF_INET;
+  peer.sin_addr.s_addr = host_addr_ != 0 ? host_addr_ : inet_addr("8.8.8.8");
+  peer.sin_port = htons(53);
+  uint32_t local = 0;
+  if (::connect(s, (struct sockaddr *) &peer, sizeof(peer)) == 0) {
+    struct sockaddr_in me {};
+    socklen_t len = sizeof(me);
+    if (::getsockname(s, (struct sockaddr *) &me, &len) == 0)
+      local = me.sin_addr.s_addr;
+  }
+  ::close(s);
+  if (local == 0)
+    return 0;
+  // /24 is an assumption, but it is the assumption every domestic LAN meets,
+  // and the limited broadcast above still covers the cases where it does not.
+  return (local & htonl(0xFFFFFF00)) | htonl(0x000000FF);
+}
+
 bool SolarmanMinimal::discover_host() {
   static const char *const PROBES[] = {"WIFIKIT-214028-READ", "HF-A11ASSISTHREAD"};
 
   if (serial_ == 0)
     ESP_LOGI(TAG, "UDP discovery: looking for any logger on the LAN ...");
   else
-    ESP_LOGI(TAG, "UDP discovery for serial %u ...", serial_);
+    ESP_LOGI(TAG, "UDP discovery for serial %" PRIu32 " ...", serial_);
 
   int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
   if (fd < 0) {
@@ -354,13 +397,26 @@ bool SolarmanMinimal::discover_host() {
     return false;
   }
 
+  // Send to the SUBNET broadcast as well as the limited one. ha-solarman
+  // reaches these dongles by asking each adapter for its broadcast address -
+  // 192.168.1.255 - while this sent only to 255.255.255.255, which plenty of
+  // access points drop and which the dongle may simply not listen on. Four
+  // sites in a row answered nothing; the probes and the port were never the
+  // problem, the destination was.
   struct sockaddr_in dest {};
   dest.sin_family = AF_INET;
-  dest.sin_addr.s_addr = htonl(INADDR_BROADCAST);
   dest.sin_port = htons(DISCOVERY_PORT);
 
-  for (const char *probe : PROBES)
-    ::sendto(fd, probe, strlen(probe), 0, (struct sockaddr *) &dest, sizeof(dest));
+  uint32_t targets[2] = {htonl(INADDR_BROADCAST), 0};
+  targets[1] = subnet_broadcast();
+
+  for (uint32_t addr : targets) {
+    if (addr == 0)
+      continue;
+    dest.sin_addr.s_addr = addr;
+    for (const char *probe : PROBES)
+      ::sendto(fd, probe, strlen(probe), 0, (struct sockaddr *) &dest, sizeof(dest));
+  }
 
   uint32_t deadline = millis() + DISCOVERY_WAIT;
   while (millis() < deadline) {
@@ -384,7 +440,7 @@ bool SolarmanMinimal::discover_host() {
     }
 
     if (serial_ != 0 && reply_serial != serial_) {
-      ESP_LOGD(TAG, "  ignored: serial %u is not the configured %u", reply_serial, serial_);
+      ESP_LOGD(TAG, "  ignored: serial %" PRIu32 " is not the configured %" PRIu32, reply_serial, serial_);
       continue;
     }
 
@@ -395,7 +451,7 @@ bool SolarmanMinimal::discover_host() {
       SolarmanSerialPrefs sp{serial_};
       serial_prefs_.save(&sp);
       prefs_ = global_preferences->make_preference<SolarmanPrefs>(serial_);
-      ESP_LOGI(TAG, "Adopted logger serial %u (discovered)", serial_);
+      ESP_LOGI(TAG, "Adopted logger serial %" PRIu32 " (discovered)", serial_);
     }
 
     host_addr_ = from.sin_addr.s_addr;
@@ -409,7 +465,7 @@ bool SolarmanMinimal::discover_host() {
   if (serial_ == 0)
     ESP_LOGW(TAG, "No logger answered either discovery probe on this LAN");
   else
-    ESP_LOGW(TAG, "Logger serial %u not found on LAN", serial_);
+    ESP_LOGW(TAG, "Logger serial %" PRIu32 " not found on LAN", serial_);
   return false;
 }
 

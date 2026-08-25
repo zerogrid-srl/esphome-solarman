@@ -17,9 +17,14 @@ static const uint16_t DISCOVERY_PORT  = 48899;
 // which LWIP ignores for connect().
 static const uint32_t CONNECT_TIMEOUT = 3000;  // ms
 static const uint32_t READ_TIMEOUT    = 3000;  // ms
-// Two probes get answered in milliseconds on a LAN; the old 5 s was
-// generosity paid for out of the main loop's budget.
-static const uint32_t DISCOVERY_WAIT  = 2500;  // ms
+// ha-solarman waits 0.5 s for a reply and repeats discovery every 15 minutes.
+// Both numbers carry the same lesson: a dongle that answers answers at once,
+// so a long wait buys nothing and is paid for out of the main loop's budget.
+static const uint32_t DISCOVERY_WAIT   = 1000;   // ms
+// ...and a failed discovery must not be retried on every poll. At a 10 s
+// interval that was three seconds of blocked loop out of every ten, next to a
+// BLE stack that does not tolerate it.
+static const uint32_t DISCOVERY_RETRY  = 300000;  // ms between failed attempts
 // Re-run discovery only after this many consecutive read failures, so a single
 // dropped packet does not throw away a working IP.
 static const uint8_t MAX_FAILURES = 3;
@@ -43,6 +48,16 @@ class SolarmanMinimal : public PollingComponent {
   // Called from YAML on_value when the user types the serial in the web UI
   void set_serial_from_text(const std::string &s);
   void set_host(const std::string &host);
+  // Emptying the address field has to actually release the address. Ignoring
+  // an empty value left the override in place until the next reboot, which
+  // looks exactly like the setting not working.
+  void clear_host() {
+    if (!host_override_)
+      return;
+    host_override_ = false;
+    host_addr_ = 0;
+    last_discovery_ms_ = 0;
+  }
   std::string host_str() const;
 
   // ── Sensors ──────────────────────────────────────────────────────────────
@@ -116,6 +131,7 @@ class SolarmanMinimal : public PollingComponent {
   bool host_override_{false};
   uint16_t sequence_{0};
   uint8_t consecutive_failures_{0};
+  uint32_t last_discovery_ms_{0};
   ESPPreferenceObject prefs_;
   ESPPreferenceObject serial_prefs_;
 
@@ -143,6 +159,7 @@ class SolarmanMinimal : public PollingComponent {
   void save_host();
 
   bool discover_host();
+  uint32_t subnet_broadcast();
   static uint32_t parse_discovery_serial(const char *reply);
   bool read_registers(uint16_t start, uint8_t count, std::vector<uint16_t> &out);
   std::vector<uint8_t> build_v5_request(uint16_t reg_start, uint8_t reg_count);
