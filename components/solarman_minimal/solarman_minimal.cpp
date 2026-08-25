@@ -357,8 +357,13 @@ uint32_t SolarmanMinimal::subnet_broadcast() {
       local = me.sin_addr.s_addr;
   }
   ::close(s);
-  if (local == 0)
+  if (local == 0) {
+    ESP_LOGW(TAG, "Could not determine our own IP for the subnet broadcast");
     return 0;
+  }
+  char me[INET_ADDRSTRLEN] = {0};
+  inet_ntop(AF_INET, &local, me, sizeof(me));
+  ESP_LOGD(TAG, "Own address %s", me);
   // /24 is an assumption, but it is the assumption every domestic LAN meets,
   // and the limited broadcast above still covers the cases where it does not.
   return (local & htonl(0xFFFFFF00)) | htonl(0x000000FF);
@@ -411,11 +416,22 @@ bool SolarmanMinimal::discover_host() {
   targets[1] = subnet_broadcast();
 
   for (uint32_t addr : targets) {
-    if (addr == 0)
+    if (addr == 0) {
+      // Say so. A destination skipped in silence is indistinguishable from one
+      // that was tried and ignored, and that is exactly the ambiguity that
+      // made a field test prove nothing.
+      ESP_LOGW(TAG, "  subnet broadcast unavailable - own address unknown");
       continue;
+    }
+    char a[INET_ADDRSTRLEN] = {0};
+    inet_ntop(AF_INET, &addr, a, sizeof(a));
+    int sent = 0;
     dest.sin_addr.s_addr = addr;
     for (const char *probe : PROBES)
-      ::sendto(fd, probe, strlen(probe), 0, (struct sockaddr *) &dest, sizeof(dest));
+      if (::sendto(fd, probe, strlen(probe), 0, (struct sockaddr *) &dest, sizeof(dest)) > 0)
+        sent++;
+    ESP_LOGI(TAG, "  probes -> %s : %d/2 sent%s", a, sent,
+             sent == 2 ? "" : " (sendto failed)");
   }
 
   uint32_t deadline = millis() + DISCOVERY_WAIT;
