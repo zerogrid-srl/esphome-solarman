@@ -70,10 +70,25 @@ solarman_minimal:
     name: "Daily production"
   total_production:
     name: "Total production"
+  daily_consumption:
+    name: "Daily consumption"
+  daily_energy_bought:
+    name: "Daily energy bought"
+  daily_energy_sold:
+    name: "Daily energy sold"
+  device_state:
+    name: "Device state"        # 0 standby, 1 self-test, 2 normal, 3 alarm, 4 fault
+  grid_connected:
+    name: "Grid connected"      # 1 tied to the utility, 0 islanded
 ```
 
 All sensors are optional — declare only what you need. Also available:
-`battery_voltage`, `pv1_voltage`, `pv2_voltage`.
+`battery_voltage`, `pv1_voltage`, `pv2_voltage`, `total_consumption`,
+`daily_battery_charge`, `daily_battery_discharge`.
+
+`device_state` and `grid_connected` are numeric rather than text or binary
+sensors: this component creates its own entities, and one entity type keeps a
+single code path. Map the value to a word where you display it.
 
 ### Setting the serial at runtime
 

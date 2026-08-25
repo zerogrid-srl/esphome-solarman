@@ -38,6 +38,25 @@ CONF_GRID_POWER       = "grid_power"
 CONF_LOAD_POWER       = "load_power"
 CONF_DAILY_PRODUCTION = "daily_production"
 CONF_TOTAL_PRODUCTION = "total_production"
+CONF_DAILY_CONSUMPTION = "daily_consumption"
+CONF_TOTAL_CONSUMPTION = "total_consumption"
+CONF_DAILY_ENERGY_BOUGHT = "daily_energy_bought"
+CONF_DAILY_ENERGY_SOLD = "daily_energy_sold"
+CONF_DAILY_BATTERY_CHARGE = "daily_battery_charge"
+CONF_DAILY_BATTERY_DISCHARGE = "daily_battery_discharge"
+CONF_DEVICE_STATE = "device_state"
+CONF_GRID_CONNECTED = "grid_connected"
+
+
+def _energy_schema():
+    """Every daily/total counter on this inverter is the same shape: kWh at one
+    decimal, monotonic within its period."""
+    return sensor.sensor_schema(
+        unit_of_measurement=UNIT_KILOWATT_HOURS,
+        accuracy_decimals=1,
+        device_class=DEVICE_CLASS_ENERGY,
+        state_class=STATE_CLASS_TOTAL_INCREASING,
+    )
 
 CONFIG_SCHEMA = cv.Schema(
     {
@@ -120,6 +139,24 @@ CONFIG_SCHEMA = cv.Schema(
             device_class=DEVICE_CLASS_ENERGY,
             state_class=STATE_CLASS_TOTAL_INCREASING,
         ),
+        cv.Optional(CONF_DAILY_CONSUMPTION): _energy_schema(),
+        cv.Optional(CONF_TOTAL_CONSUMPTION): _energy_schema(),
+        cv.Optional(CONF_DAILY_ENERGY_BOUGHT): _energy_schema(),
+        cv.Optional(CONF_DAILY_ENERGY_SOLD): _energy_schema(),
+        cv.Optional(CONF_DAILY_BATTERY_CHARGE): _energy_schema(),
+        cv.Optional(CONF_DAILY_BATTERY_DISCHARGE): _energy_schema(),
+        # Enum from register 0x003B: 0 standby, 1 self-test, 2 normal,
+        # 3 alarm, 4 fault. Published raw; label it where it is displayed.
+        cv.Optional(CONF_DEVICE_STATE): sensor.sensor_schema(
+            accuracy_decimals=0,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ),
+        # 1 = tied to the utility, 0 = islanded. Numeric rather than a
+        # binary_sensor so this component keeps a single entity type.
+        cv.Optional(CONF_GRID_CONNECTED): sensor.sensor_schema(
+            accuracy_decimals=0,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ),
     }
 ).extend(cv.polling_component_schema("30s"))
 
@@ -144,6 +181,14 @@ async def to_code(config):
         (CONF_LOAD_POWER,       "set_load_power_sensor"),
         (CONF_DAILY_PRODUCTION, "set_daily_production_sensor"),
         (CONF_TOTAL_PRODUCTION, "set_total_production_sensor"),
+        (CONF_DAILY_CONSUMPTION, "set_daily_consumption_sensor"),
+        (CONF_TOTAL_CONSUMPTION, "set_total_consumption_sensor"),
+        (CONF_DAILY_ENERGY_BOUGHT, "set_daily_energy_bought_sensor"),
+        (CONF_DAILY_ENERGY_SOLD, "set_daily_energy_sold_sensor"),
+        (CONF_DAILY_BATTERY_CHARGE, "set_daily_battery_charge_sensor"),
+        (CONF_DAILY_BATTERY_DISCHARGE, "set_daily_battery_discharge_sensor"),
+        (CONF_DEVICE_STATE, "set_device_state_sensor"),
+        (CONF_GRID_CONNECTED, "set_grid_connected_sensor"),
     ]
     for conf_key, setter in sensor_map:
         if conf_key in config:

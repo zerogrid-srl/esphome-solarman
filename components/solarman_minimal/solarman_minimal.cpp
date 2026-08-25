@@ -1,13 +1,18 @@
 #include "solarman_minimal.h"
 #include "esphome/core/log.h"
 #include "esphome/core/hal.h"
+#include "esphome/core/application.h"
+#include "esphome/components/wifi/wifi_component.h"
 
 #include <sys/socket.h>
+#include <sys/select.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
+#include <cstdlib>
 
 namespace esphome {
 namespace solarman_minimal {
@@ -25,14 +30,23 @@ static const char *const TAG = "solarman";
 // hardware — long enough for ESPHome to warn, and long enough to disturb a BLE
 // stack sharing the same device.
 //
-// Batch 1  0x0060..0x006F  (16 regs)
-//   [0]+[1] 0x0060/0x0061 = Total Production  ×0.1 kWh, 32-bit UNSIGNED,
-//                           first register is the LOW word.
-//   [12]    0x006C         = Daily Production  ×0.1 kWh
-//   [13]    0x006D         = PV1 Voltage       ×0.1 V
-//   [15]    0x006F         = PV2 Voltage       ×0.1 V
+// Batch 1  0x003B..0x006F  (53 regs) - state, daily counters, energy totals
+//   [ 0]      0x003B = Device State, enum: 0 standby, 1 self-test, 2 normal,
+//                      3 alarm, 4 fault
+//   [11]      0x0046 = Daily Battery Charge    x0.1 kWh
+//   [12]      0x0047 = Daily Battery Discharge x0.1 kWh
+//   [17]      0x004C = Daily Energy Bought     x0.1 kWh
+//   [18]      0x004D = Daily Energy Sold       x0.1 kWh
+//   [25]      0x0054 = Daily Load Consumption  x0.1 kWh
+//   [26]+[27] 0x0055/0x0056 = Total Load Consumption x0.1 kWh, 32-bit UNSIGNED,
+//                             first register is the LOW word.
+//   [37]+[38] 0x0060/0x0061 = Total Production      x0.1 kWh, 32-bit UNSIGNED,
+//                             first register is the LOW word.
+//   [49]      0x006C = Daily Production x0.1 kWh
+//   [50]      0x006D = PV1 Voltage      x0.1 V
+//   [52]      0x006F = PV2 Voltage      x0.1 V
 //
-// Batch 2  0x00A9..0x00BE  (22 regs)
+// Batch 2  0x00A9..0x00C2  (26 regs)
 //   [0]  0x00A9 = Grid Power      W  signed
 //   [9]  0x00B2 = Load Power      W  signed
 //   [14] 0x00B7 = Battery Voltage ×0.01 V
@@ -40,6 +54,12 @@ static const char *const TAG = "solarman";
 //   [17] 0x00BA = PV1 Power       W
 //   [18] 0x00BB = PV2 Power       W
 //   [21] 0x00BE = Battery Power   W  signed, POSITIVE = DISCHARGING
+//   [25] 0x00C2 = Grid connected, non-zero = tied to the utility
+//
+// Both ranges were WIDENED rather than adding a third batch. A Modbus read
+// costs one TCP round trip whatever its length, so 53 registers cost what 16
+// cost, while a third connection would add roughly 350 ms to the main loop -
+// the very budget the two-batch split was made to protect.
 //
 // Confirmed against a Deye 8K SG05LP1 on 2026-08-22:
 //   * Battery voltage scale 0.01 (read 52.3 V on a 48 V bank).
@@ -57,8 +77,10 @@ static const char *const TAG = "solarman";
 // either — the profile marks the sensor `attributes: [inverse]` while the
 // parser tests a differently-named key, `inverted`. To be settled by comparing
 // against a working integration during grid import or export.
-static const uint16_t REG_BATCH1_START = 0x0060;
+static const uint16_t REG_BATCH1_START = 0x003B;
+static const uint8_t  REG_BATCH1_COUNT = 53;  // through 0x006F
 static const uint16_t REG_BATCH2_START = 0x00A9;
+static const uint8_t  REG_BATCH2_COUNT = 26;  // through 0x00C2
 
 // Fixed NVS key for the serial preference (independent of the serial value)
 static const uint32_t SERIAL_PREFS_KEY = 0x534C4D41;  // "SLMA"
@@ -82,7 +104,10 @@ void SolarmanMinimal::setup() {
       serial_ = sp.serial;
       ESP_LOGI(TAG, "Loaded serial %u from flash", serial_);
     } else {
-      ESP_LOGW(TAG, "Serial not configured - set it via the web UI");
+      // Not an error: discovery will adopt a logger and its serial on the
+      // first update. Typing one in only matters when several sticks share
+      // the LAN and a specific one is wanted.
+      ESP_LOGI(TAG, "No serial stored - will adopt the first logger discovered");
       return;
     }
   }
@@ -128,6 +153,9 @@ void SolarmanMinimal::set_host(const std::string &host) {
   if (inet_pton(AF_INET, host.c_str(), &a) == 1) {
     host_addr_ = a.s_addr;
     host_override_ = true;
+    // Same reason as the serial: make it survive an unclean reset.
+    global_preferences->sync();
+    ESP_LOGI(TAG, "Host set to %s (manual)", host_str().c_str());
   } else {
     ESP_LOGE(TAG, "Invalid host IP: '%s'", host.c_str());
   }
@@ -142,6 +170,11 @@ void SolarmanMinimal::set_serial_from_text(const std::string &s) {
   serial_ = val;
   SolarmanSerialPrefs sp{val};
   serial_prefs_.save(&sp);
+  // save() only queues; ESPHome flushes preferences on a timer and on a clean
+  // shutdown. A watchdog reset is neither, so a serial typed seconds before a
+  // crash was silently lost - which is exactly the situation someone is in
+  // while trying to configure a device that keeps rebooting. Flush now.
+  global_preferences->sync();
   // Re-bind the IP prefs slot to the new serial key
   prefs_ = global_preferences->make_preference<SolarmanPrefs>(serial_);
   // Clear any cached IP so discovery runs fresh for the new serial
@@ -153,11 +186,14 @@ void SolarmanMinimal::set_serial_from_text(const std::string &s) {
 // ── update ────────────────────────────────────────────────────────────────
 
 void SolarmanMinimal::update() {
-  if (serial_ == 0) {
-    ESP_LOGD(TAG, "Waiting for serial number to be configured");
+  if (!wifi::global_wifi_component->is_connected()) {
+    ESP_LOGD(TAG, "WiFi down - skipping poll");
     return;
   }
-  if (!has_host() && !discover_host()) {
+
+  // Discovery supplies whichever of the two is missing: the address, the
+  // serial, or both. Nothing has to be configured for this to work.
+  if ((serial_ == 0 || !has_host()) && !discover_host()) {
     ESP_LOGW(TAG, "Discovery failed - will retry next cycle");
     return;
   }
@@ -166,7 +202,7 @@ void SolarmanMinimal::update() {
   // Read first because it drives the failure counter and carries the values
   // that matter most; if the inverter is unreachable, skip the rest.
   std::vector<uint16_t> b2;
-  if (!read_registers(REG_BATCH2_START, 22, b2)) {
+  if (!read_registers(REG_BATCH2_START, REG_BATCH2_COUNT, b2)) {
     consecutive_failures_++;
     ESP_LOGW(TAG, "Read failed (%u/%u)", consecutive_failures_, MAX_FAILURES);
     if (consecutive_failures_ >= MAX_FAILURES && !host_override_) {
@@ -177,6 +213,7 @@ void SolarmanMinimal::update() {
     return;
   }
   consecutive_failures_ = 0;
+  clear_error();
   if (grid_power_)      publish_signed(grid_power_, b2[0]);
   if (load_power_)      publish_signed(load_power_, b2[9]);
   if (battery_voltage_) battery_voltage_->publish_state(b2[14] * 0.01f);
@@ -184,17 +221,30 @@ void SolarmanMinimal::update() {
   if (pv1_power_)       pv1_power_->publish_state(b2[17]);
   if (pv2_power_)       pv2_power_->publish_state(b2[18]);
   if (battery_power_)   publish_signed(battery_power_, b2[21]);
+  // Published as 0/1 rather than a binary_sensor: this component builds its own
+  // entities, and a numeric sensor keeps every consumer on one code path.
+  if (grid_connected_)  grid_connected_->publish_state(b2[25] != 0 ? 1.0f : 0.0f);
 
-  // ── Batch 1: energy totals + PV voltages ────────────────────────────────
+  // ── Batch 1: state, daily counters, energy totals, PV voltages ──────────
   std::vector<uint16_t> b1;
-  if (read_registers(REG_BATCH1_START, 16, b1)) {
+  if (read_registers(REG_BATCH1_START, REG_BATCH1_COUNT, b1)) {
+    if (device_state_) device_state_->publish_state(b1[0]);
+    if (daily_battery_charge_)    daily_battery_charge_->publish_state(b1[11] * 0.1f);
+    if (daily_battery_discharge_) daily_battery_discharge_->publish_state(b1[12] * 0.1f);
+    if (daily_energy_bought_)     daily_energy_bought_->publish_state(b1[17] * 0.1f);
+    if (daily_energy_sold_)       daily_energy_sold_->publish_state(b1[18] * 0.1f);
+    if (daily_consumption_)       daily_consumption_->publish_state(b1[25] * 0.1f);
+    if (total_consumption_) {
+      uint32_t raw = (uint32_t) b1[26] | ((uint32_t) b1[27] << 16);
+      total_consumption_->publish_state(raw * 0.1f);
+    }
     if (total_production_) {
-      uint32_t raw = (uint32_t) b1[0] | ((uint32_t) b1[1] << 16);
+      uint32_t raw = (uint32_t) b1[37] | ((uint32_t) b1[38] << 16);
       total_production_->publish_state(raw * 0.1f);
     }
-    if (daily_production_) daily_production_->publish_state(b1[12] * 0.1f);
-    if (pv1_voltage_)      pv1_voltage_->publish_state(b1[13] * 0.1f);
-    if (pv2_voltage_)      pv2_voltage_->publish_state(b1[15] * 0.1f);
+    if (daily_production_) daily_production_->publish_state(b1[49] * 0.1f);
+    if (pv1_voltage_)      pv1_voltage_->publish_state(b1[50] * 0.1f);
+    if (pv2_voltage_)      pv2_voltage_->publish_state(b1[52] * 0.1f);
   }
 }
 
@@ -256,12 +306,28 @@ void SolarmanMinimal::scan_registers() {
 
 // ── UDP Discovery ─────────────────────────────────────────────────────────
 //
-// Solarman logger sticks answer a broadcast probe on UDP port 48899.
-// Reply looks like: "<ip>,<mac>,<serial>"  (exact format varies by firmware),
-// so we match on the serial number appearing anywhere in the payload.
+// Logger sticks answer a broadcast probe on UDP port 48899 with a three-field
+// reply: "<ip>,<mac>,<serial>".
+//
+// TWO probes are sent, because they are not interchangeable. Many sticks are
+// built on Hi-Flying WiFi modules that answer HF-A11ASSISTHREAD and ignore
+// WIFIKIT-214028-READ entirely — a Deye 8K SG05LP1 in the field stayed silent
+// on the latter alone, including when probed unicast, while its TCP port 8899
+// was open and serving. Sending only one probe looks exactly like "no logger
+// on this network", which is a misleading failure. Upstream ha-solarman sends
+// both for the same reason.
+//
+// When no serial is configured, the first well-formed reply is adopted along
+// with the serial it carries. That makes a zero-configuration deploy possible:
+// no IP, no serial, nothing to type in.
 
 bool SolarmanMinimal::discover_host() {
-  ESP_LOGI(TAG, "UDP discovery for serial %u ...", serial_);
+  static const char *const PROBES[] = {"WIFIKIT-214028-READ", "HF-A11ASSISTHREAD"};
+
+  if (serial_ == 0)
+    ESP_LOGI(TAG, "UDP discovery: looking for any logger on the LAN ...");
+  else
+    ESP_LOGI(TAG, "UDP discovery for serial %u ...", serial_);
 
   int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
   if (fd < 0) {
@@ -293,14 +359,12 @@ bool SolarmanMinimal::discover_host() {
   dest.sin_addr.s_addr = htonl(INADDR_BROADCAST);
   dest.sin_port = htons(DISCOVERY_PORT);
 
-  static const char PROBE[] = "WIFIKIT-214028-READ";
-  ::sendto(fd, PROBE, strlen(PROBE), 0, (struct sockaddr *) &dest, sizeof(dest));
-
-  char serial_str[12];
-  snprintf(serial_str, sizeof(serial_str), "%u", serial_);
+  for (const char *probe : PROBES)
+    ::sendto(fd, probe, strlen(probe), 0, (struct sockaddr *) &dest, sizeof(dest));
 
   uint32_t deadline = millis() + DISCOVERY_WAIT;
   while (millis() < deadline) {
+    App.feed_wdt();
     char buf[256];
     struct sockaddr_in from {};
     socklen_t from_len = sizeof(from);
@@ -313,18 +377,59 @@ bool SolarmanMinimal::discover_host() {
     inet_ntop(AF_INET, &from.sin_addr, from_str, sizeof(from_str));
     ESP_LOGD(TAG, "UDP reply from %s: %s", from_str, buf);
 
-    if (strstr(buf, serial_str) != nullptr) {
-      host_addr_ = from.sin_addr.s_addr;
-      ESP_LOGI(TAG, "Logger found at %s", host_str().c_str());
-      save_host();
-      ::close(fd);
-      return true;
+    uint32_t reply_serial = parse_discovery_serial(buf);
+    if (reply_serial == 0) {
+      ESP_LOGD(TAG, "  ignored: no serial in reply");
+      continue;
     }
+
+    if (serial_ != 0 && reply_serial != serial_) {
+      ESP_LOGD(TAG, "  ignored: serial %u is not the configured %u", reply_serial, serial_);
+      continue;
+    }
+
+    if (serial_ == 0) {
+      // Zero-config path: adopt this logger and remember its serial, so a
+      // later run can tell it apart from a second stick appearing on the LAN.
+      serial_ = reply_serial;
+      SolarmanSerialPrefs sp{serial_};
+      serial_prefs_.save(&sp);
+      prefs_ = global_preferences->make_preference<SolarmanPrefs>(serial_);
+      ESP_LOGI(TAG, "Adopted logger serial %u (discovered)", serial_);
+    }
+
+    host_addr_ = from.sin_addr.s_addr;
+    ESP_LOGI(TAG, "Logger found at %s", host_str().c_str());
+    save_host();
+    ::close(fd);
+    return true;
   }
 
   ::close(fd);
-  ESP_LOGW(TAG, "Logger serial %u not found on LAN", serial_);
+  if (serial_ == 0)
+    ESP_LOGW(TAG, "No logger answered either discovery probe on this LAN");
+  else
+    ESP_LOGW(TAG, "Logger serial %u not found on LAN", serial_);
   return false;
+}
+
+// Parse "<ip>,<mac>,<serial>" and return the serial, or 0 if the reply does
+// not have that shape. Strict on purpose: a malformed reply adopted as a
+// logger would send every later read to the wrong address.
+uint32_t SolarmanMinimal::parse_discovery_serial(const char *reply) {
+  const char *first = strchr(reply, ',');
+  if (first == nullptr)
+    return 0;
+  const char *second = strchr(first + 1, ',');
+  if (second == nullptr)
+    return 0;
+  const char *serial_field = second + 1;
+  if (*serial_field == '\0')
+    return 0;
+  for (const char *p = serial_field; *p != '\0'; p++)
+    if (*p < '0' || *p > '9')
+      return 0;  // trailing junk or a non-numeric hostname: not a serial
+  return (uint32_t) strtoul(serial_field, nullptr, 10);
 }
 
 // ── TCP register read ─────────────────────────────────────────────────────
@@ -347,11 +452,53 @@ bool SolarmanMinimal::read_registers(uint16_t start, uint8_t count, std::vector<
   dest.sin_addr.s_addr = host_addr_;
   dest.sin_port = htons(SOLARMAN_PORT);
 
-  if (::connect(fd, (struct sockaddr *) &dest, sizeof(dest)) < 0) {
+  // connect() must NOT be left blocking. SO_SNDTIMEO does not bound it on
+  // LWIP, so it holds the main loop until the TCP handshake gives up - and
+  // nothing feeds the task watchdog while it waits, so the device reboots
+  // instead of merely polling slowly. Seen in the field the moment a dongle
+  // was present but its port 8899 was already taken by another poller: on the
+  // bench, with no host at all, connect fails instantly and hides the bug.
+  int flags = ::fcntl(fd, F_GETFL, 0);
+  ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+  int rc = ::connect(fd, (struct sockaddr *) &dest, sizeof(dest));
+  if (rc < 0 && errno != EINPROGRESS) {
     ESP_LOGW(TAG, "TCP connect to %s:%u failed: %d", host_str().c_str(), SOLARMAN_PORT, errno);
+    note_error("8899", errno);
     ::close(fd);
     return false;
   }
+  if (rc < 0) {
+    bool connected = false;
+    uint32_t deadline = millis() + CONNECT_TIMEOUT;
+    while (millis() < deadline) {
+      App.feed_wdt();
+      fd_set wfds;
+      FD_ZERO(&wfds);
+      FD_SET(fd, &wfds);
+      struct timeval sel {};
+      sel.tv_sec = 0;
+      sel.tv_usec = 100000;  // 100 ms per pass, so the watchdog is fed often
+      int n = ::select(fd + 1, nullptr, &wfds, nullptr, &sel);
+      if (n > 0) {
+        int err = 0;
+        socklen_t len = sizeof(err);
+        ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+        connected = (err == 0);
+        if (!connected)
+          errno = err;
+        break;
+      }
+      if (n < 0 && errno != EINTR)
+        break;
+    }
+    if (!connected) {
+      ESP_LOGW(TAG, "TCP connect to %s:%u failed: %d", host_str().c_str(), SOLARMAN_PORT, errno);
+      note_error("8899", errno);
+      ::close(fd);
+      return false;
+    }
+  }
+  ::fcntl(fd, F_SETFL, flags);  // back to blocking for send/recv
 
   std::vector<uint8_t> req = build_v5_request(start, count);
   if (::send(fd, req.data(), req.size(), 0) < 0) {
@@ -368,6 +515,7 @@ bool SolarmanMinimal::read_registers(uint16_t start, uint8_t count, std::vector<
 
   uint32_t deadline = millis() + READ_TIMEOUT;
   while (resp.size() < expected && millis() < deadline) {
+    App.feed_wdt();
     uint8_t chunk[128];
     int n = ::recv(fd, chunk, sizeof(chunk), 0);
     if (n > 0) {
@@ -381,8 +529,10 @@ bool SolarmanMinimal::read_registers(uint16_t start, uint8_t count, std::vector<
   }
   ::close(fd);
 
-  if (!parse_v5_response(resp, out))
+  if (!parse_v5_response(resp, out)) {
+    note_error("V5", resp.empty() ? 0 : -1);
     return false;
+  }
 
   // Guard the callers' fixed indexes: a short reply must not be treated as valid
   if (out.size() < count) {
