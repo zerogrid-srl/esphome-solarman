@@ -26,6 +26,7 @@ solarman_minimal_ns = cg.esphome_ns.namespace("solarman_minimal")
 SolarmanMinimal = solarman_minimal_ns.class_("SolarmanMinimal", cg.PollingComponent)
 
 CONF_HOST             = "host"
+CONF_TCP_SCAN         = "tcp_scan"
 CONF_SERIAL           = "serial"
 CONF_PV1_POWER        = "pv1_power"
 CONF_PV1_VOLTAGE      = "pv1_voltage"
@@ -66,6 +67,12 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_SERIAL, default=0): cv.uint32_t,
         # Optional: skip UDP discovery and use a fixed IP
         cv.Optional(CONF_HOST): cv.string,
+        # Sweep the local /24 for an open port 8899 when UDP discovery finds
+        # nothing. Off by default: it is a scan of someone else's network and
+        # should be a deliberate choice, not a surprise. Five dongles across
+        # four sites never answered a UDP probe while all of them served 8899,
+        # so on those this is the only discovery with a chance of working.
+        cv.Optional(CONF_TCP_SCAN, default=False): cv.boolean,
 
         cv.Optional(CONF_PV1_POWER): sensor.sensor_schema(
             unit_of_measurement=UNIT_WATT,
@@ -166,6 +173,7 @@ async def to_code(config):
     await cg.register_component(var, config)
 
     cg.add(var.set_serial(config[CONF_SERIAL]))  # 0 = load from flash
+    cg.add(var.set_tcp_scan(config[CONF_TCP_SCAN]))
     if CONF_HOST in config:
         cg.add(var.set_host(config[CONF_HOST]))
 

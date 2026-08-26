@@ -25,6 +25,17 @@ static const uint32_t DISCOVERY_WAIT   = 1000;   // ms
 // interval that was three seconds of blocked loop out of every ten, next to a
 // BLE stack that does not tolerate it.
 static const uint32_t DISCOVERY_RETRY  = 300000;  // ms between failed attempts
+
+// TCP subnet scan. Four sockets at a time, not sixteen: ESPHome sizes the LWIP
+// socket pool from the components it can see in the config, and an external
+// component is not among them. On the customer's build that pool is 17 sockets
+// with 11 already spoken for by api, captive_portal and web_server, so a wide
+// fan-out would starve them and take down the API instead of finding a dongle.
+static const uint8_t  SCAN_PARALLEL = 4;
+static const uint32_t SCAN_WAIT     = 250;   // ms per batch
+// 254 addresses at 4 per poll is about ten minutes on a 10 s interval. Slow,
+// but it runs once and costs a quarter second per cycle - and unlike the UDP
+// probe it does not depend on the dongle implementing anything.
 // Re-run discovery only after this many consecutive read failures, so a single
 // dropped packet does not throw away a working IP.
 static const uint8_t MAX_FAILURES = 3;
@@ -48,6 +59,7 @@ class SolarmanMinimal : public PollingComponent {
   // Called from YAML on_value when the user types the serial in the web UI
   void set_serial_from_text(const std::string &s);
   void set_host(const std::string &host);
+  void set_tcp_scan(bool enabled) { tcp_scan_ = enabled; }
   // Emptying the address field has to actually release the address. Ignoring
   // an empty value left the override in place until the next reboot, which
   // looks exactly like the setting not working.
@@ -132,6 +144,9 @@ class SolarmanMinimal : public PollingComponent {
   uint16_t sequence_{0};
   uint8_t consecutive_failures_{0};
   uint32_t last_discovery_ms_{0};
+  bool tcp_scan_{false};
+  uint8_t scan_next_{1};       // host octet to try next, 1..254
+  bool scan_wrapped_{false};   // a full sweep has completed without a find
   ESPPreferenceObject prefs_;
   ESPPreferenceObject serial_prefs_;
 
@@ -159,6 +174,10 @@ class SolarmanMinimal : public PollingComponent {
   void save_host();
 
   bool discover_host();
+  // One batch of the sweep. Returns true only when a logger was confirmed.
+  bool tcp_scan_step();
+  // Does this address speak Solarman V5? Sets host_addr_ on success.
+  bool verify_candidate(uint32_t addr);
   uint32_t subnet_broadcast();
   static uint32_t parse_discovery_serial(const char *reply);
   bool read_registers(uint16_t start, uint8_t count, std::vector<uint16_t> &out);

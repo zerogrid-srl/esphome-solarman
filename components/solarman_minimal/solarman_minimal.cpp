@@ -206,12 +206,20 @@ void SolarmanMinimal::update() {
     if (last_discovery_ms_ != 0 && (now - last_discovery_ms_) < DISCOVERY_RETRY) {
       ESP_LOGD(TAG, "Discovery backing off - %u s to the next attempt",
                (unsigned) ((DISCOVERY_RETRY - (now - last_discovery_ms_)) / 1000));
-      return;
+      if (tcp_scan_ && !has_host() && tcp_scan_step())
+        last_discovery_ms_ = 0;  // found it; stop backing off
+      else
+        return;
     }
     last_discovery_ms_ = now;
     if (!discover_host()) {
       ESP_LOGW(TAG, "Discovery failed - next attempt in %u s",
                (unsigned) (DISCOVERY_RETRY / 1000));
+      // The UDP probe backs off for five minutes; the scan carries on in the
+      // meantime, one small batch per poll. It is the only one of the two that
+      // has ever had a chance of working on these dongles.
+      if (tcp_scan_ && !has_host())
+        tcp_scan_step();
       return;
     }
     last_discovery_ms_ = 0;
@@ -370,6 +378,128 @@ uint32_t SolarmanMinimal::subnet_broadcast() {
 #endif
   ESP_LOGW(TAG, "No IPv4 address yet - cannot compute the subnet broadcast");
   return 0;
+}
+
+
+// ── TCP subnet scan ───────────────────────────────────────────────────────
+//
+// The last resort, and the only discovery that does not require the dongle to
+// implement anything: find who has port 8899 open. Five dongles across four
+// sites never answered a UDP probe, while every one of them served 8899.
+//
+// Incremental by design. One batch per poll, never blocking the main loop for
+// more than SCAN_WAIT, watchdog fed throughout - the lesson of a device that
+// rebooted every 30 seconds because a single connect() was left blocking.
+
+bool SolarmanMinimal::verify_candidate(uint32_t addr) {
+  uint32_t saved = host_addr_;
+  host_addr_ = addr;
+  std::vector<uint16_t> probe;
+  // One register is enough to tell a Solarman logger from anything else that
+  // happens to listen on 8899.
+  bool ok = read_registers(REG_BATCH2_START, 1, probe);
+  if (ok) {
+    ESP_LOGI(TAG, "Logger confirmed at %s", host_str().c_str());
+    save_host();
+    return true;
+  }
+  host_addr_ = saved;
+  return false;
+}
+
+bool SolarmanMinimal::tcp_scan_step() {
+  uint32_t bcast = subnet_broadcast();
+  if (bcast == 0)
+    return false;
+  uint32_t network = bcast & htonl(0xFFFFFF00);
+
+  int fds[SCAN_PARALLEL];
+  uint32_t addrs[SCAN_PARALLEL];
+  int count = 0, maxfd = -1;
+
+  for (int i = 0; i < SCAN_PARALLEL && scan_next_ < 255; i++) {
+    uint32_t addr = network | htonl(scan_next_);
+    scan_next_++;
+    if (addr == subnet_broadcast() || addr == network)
+      continue;
+
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+      // The pool is exhausted - stop asking for more this round rather than
+      // spinning on a failure we cannot fix.
+      ESP_LOGW(TAG, "scan: no sockets available (%d)", errno);
+      break;
+    }
+    int flags = ::fcntl(fd, F_GETFL, 0);
+    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    struct sockaddr_in dest {};
+    dest.sin_family = AF_INET;
+    dest.sin_addr.s_addr = addr;
+    dest.sin_port = htons(SOLARMAN_PORT);
+    int rc = ::connect(fd, (struct sockaddr *) &dest, sizeof(dest));
+    if (rc < 0 && errno != EINPROGRESS) {
+      ::close(fd);
+      continue;
+    }
+    fds[count] = fd;
+    addrs[count] = addr;
+    if (fd > maxfd)
+      maxfd = fd;
+    count++;
+  }
+
+  uint32_t found = 0;
+  if (count > 0) {
+    uint32_t deadline = millis() + SCAN_WAIT;
+    while (millis() < deadline && found == 0) {
+      App.feed_wdt();
+      fd_set wfds;
+      FD_ZERO(&wfds);
+      for (int i = 0; i < count; i++)
+        FD_SET(fds[i], &wfds);
+      struct timeval sel {};
+      sel.tv_sec = 0;
+      sel.tv_usec = 50000;  // 50 ms per pass, so the watchdog is fed often
+      if (::select(maxfd + 1, nullptr, &wfds, nullptr, &sel) <= 0)
+        continue;
+      for (int i = 0; i < count; i++) {
+        if (!FD_ISSET(fds[i], &wfds))
+          continue;
+        int err = 0;
+        socklen_t len = sizeof(err);
+        ::getsockopt(fds[i], SOL_SOCKET, SO_ERROR, &err, &len);
+        if (err == 0) {
+          found = addrs[i];
+          break;
+        }
+      }
+    }
+    for (int i = 0; i < count; i++)
+      ::close(fds[i]);
+  }
+
+  if (scan_next_ >= 255) {
+    scan_next_ = 1;
+    scan_wrapped_ = true;
+    ESP_LOGW(TAG, "scan: full sweep finished, nothing on port %u", SOLARMAN_PORT);
+  } else if ((scan_next_ % 40) < SCAN_PARALLEL) {
+    ESP_LOGI(TAG, "scan: at .%u of 254", (unsigned) scan_next_);
+  }
+
+  if (found == 0)
+    return false;
+
+  char a[INET_ADDRSTRLEN] = {0};
+  inet_ntop(AF_INET, &found, a, sizeof(a));
+  ESP_LOGI(TAG, "scan: port %u open at %s - checking whether it speaks V5",
+           SOLARMAN_PORT, a);
+  if (verify_candidate(found))
+    return true;
+  // Something else lives on 8899 here. Say so and keep going: silence would
+  // leave the sweep looking identical to one that found nothing at all.
+  ESP_LOGW(TAG, "scan: %s did not answer V5 - not a Solarman logger", a);
+  return false;
 }
 
 bool SolarmanMinimal::discover_host() {
