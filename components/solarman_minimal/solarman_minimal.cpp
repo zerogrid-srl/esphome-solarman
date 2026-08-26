@@ -405,12 +405,21 @@ bool SolarmanMinimal::discover_host() {
     return false;
   }
 
-  // Send to the SUBNET broadcast as well as the limited one. ha-solarman
-  // reaches these dongles by asking each adapter for its broadcast address -
-  // 192.168.1.255 - while this sent only to 255.255.255.255, which plenty of
-  // access points drop and which the dongle may simply not listen on. Four
-  // sites in a row answered nothing; the probes and the port were never the
-  // problem, the destination was.
+  // A second socket, deliberately NOT bound, to send from.
+  //
+  // ha-solarman creates its endpoint without local_addr, so its probes leave
+  // from an ephemeral port; ours left from 48899 because the same socket was
+  // bound to receive on it. Sending to both broadcast addresses from the fixed
+  // port was tested at a customer and answered nothing, which leaves the
+  // source port as the last difference between the two implementations.
+  //
+  // Both sockets are then watched for the reply: the ephemeral one catches a
+  // dongle that answers its sender, the bound one catches a dongle that
+  // answers to 48899 or broadcasts. Neither case is given up on.
+  int tx = ::socket(AF_INET, SOCK_DGRAM, 0);
+  if (tx >= 0)
+    ::setsockopt(tx, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+
   struct sockaddr_in dest {};
   dest.sin_family = AF_INET;
   dest.sin_port = htons(DISCOVERY_PORT);
@@ -428,13 +437,17 @@ bool SolarmanMinimal::discover_host() {
     }
     char a[INET_ADDRSTRLEN] = {0};
     inet_ntop(AF_INET, &addr, a, sizeof(a));
-    int sent = 0;
+    int sent = 0, sent_eph = 0;
     dest.sin_addr.s_addr = addr;
-    for (const char *probe : PROBES)
+    for (const char *probe : PROBES) {
       if (::sendto(fd, probe, strlen(probe), 0, (struct sockaddr *) &dest, sizeof(dest)) > 0)
         sent++;
-    ESP_LOGI(TAG, "  probes -> %s : %d/2 sent%s", a, sent,
-             sent == 2 ? "" : " (sendto failed)");
+      if (tx >= 0 &&
+          ::sendto(tx, probe, strlen(probe), 0, (struct sockaddr *) &dest, sizeof(dest)) > 0)
+        sent_eph++;
+    }
+    ESP_LOGI(TAG, "  probes -> %s : %d/2 from :%u, %d/2 from ephemeral", a, sent,
+             DISCOVERY_PORT, sent_eph);
   }
 
   uint32_t deadline = millis() + DISCOVERY_WAIT;
@@ -450,7 +463,8 @@ bool SolarmanMinimal::discover_host() {
 
     char from_str[INET_ADDRSTRLEN] = {0};
     inet_ntop(AF_INET, &from.sin_addr, from_str, sizeof(from_str));
-    ESP_LOGD(TAG, "UDP reply from %s: %s", from_str, buf);
+    ESP_LOGD(TAG, "UDP reply from %s on %s: %s", from_str,
+             src == fd ? "the bound port" : "the ephemeral port", buf);
 
     uint32_t reply_serial = parse_discovery_serial(buf);
     if (reply_serial == 0) {
@@ -477,10 +491,14 @@ bool SolarmanMinimal::discover_host() {
     ESP_LOGI(TAG, "Logger found at %s", host_str().c_str());
     save_host();
     ::close(fd);
+    if (tx >= 0)
+      ::close(tx);
     return true;
   }
 
   ::close(fd);
+  if (tx >= 0)
+    ::close(tx);
   if (serial_ == 0)
     ESP_LOGW(TAG, "No logger answered either discovery probe on this LAN");
   else
