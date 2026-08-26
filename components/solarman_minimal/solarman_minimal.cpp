@@ -453,10 +453,28 @@ bool SolarmanMinimal::discover_host() {
   uint32_t deadline = millis() + DISCOVERY_WAIT;
   while (millis() < deadline) {
     App.feed_wdt();
+
+    // Watch both sockets: the ephemeral one catches a dongle that answers its
+    // sender, the bound one catches a dongle that answers to 48899 or
+    // broadcasts. select() in short passes rather than a blocking recvfrom,
+    // so the watchdog keeps being fed and neither socket starves the other.
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(fd, &rfds);
+    if (tx >= 0)
+      FD_SET(tx, &rfds);
+    struct timeval sel {};
+    sel.tv_sec = 0;
+    sel.tv_usec = 100000;
+    int ready = ::select((tx > fd ? tx : fd) + 1, &rfds, nullptr, nullptr, &sel);
+    if (ready <= 0)
+      continue;
+    int src = FD_ISSET(fd, &rfds) ? fd : tx;
+
     char buf[256];
     struct sockaddr_in from {};
     socklen_t from_len = sizeof(from);
-    int n = ::recvfrom(fd, buf, sizeof(buf) - 1, 0, (struct sockaddr *) &from, &from_len);
+    int n = ::recvfrom(src, buf, sizeof(buf) - 1, 0, (struct sockaddr *) &from, &from_len);
     if (n <= 0)
       continue;  // timeout or error, keep waiting until the deadline
     buf[n] = '\0';
