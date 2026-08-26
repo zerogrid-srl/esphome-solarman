@@ -341,32 +341,30 @@ void SolarmanMinimal::scan_registers() {
 // socket sends no packet: it only asks the stack which source address it would
 // use, which is the portable way to learn our IP without an ESPHome API that
 // differs between frameworks.
+// The /24 broadcast for the network we are on.
+//
+// The first attempt at this used connect() on a UDP socket and getsockname()
+// to learn our own address - the usual portable trick. It does not work on
+// LWIP: getsockname() on a socket that was never explicitly bound returns
+// 0.0.0.0, so the subnet broadcast was skipped and a whole field test proved
+// nothing. ESPHome's WiFi component knows the address for certain; the string
+// round trip avoids depending on how IPAddress stores it, which differs
+// between the IPv6 and IPv4-only builds.
 uint32_t SolarmanMinimal::subnet_broadcast() {
-  int s = ::socket(AF_INET, SOCK_DGRAM, 0);
-  if (s < 0)
-    return 0;
-  struct sockaddr_in peer {};
-  peer.sin_family = AF_INET;
-  peer.sin_addr.s_addr = host_addr_ != 0 ? host_addr_ : inet_addr("8.8.8.8");
-  peer.sin_port = htons(53);
-  uint32_t local = 0;
-  if (::connect(s, (struct sockaddr *) &peer, sizeof(peer)) == 0) {
-    struct sockaddr_in me {};
-    socklen_t len = sizeof(me);
-    if (::getsockname(s, (struct sockaddr *) &me, &len) == 0)
-      local = me.sin_addr.s_addr;
+  for (auto &ip : wifi::global_wifi_component->get_ip_addresses()) {
+    if (!ip.is_set())
+      continue;
+    std::string text = ip.str();
+    struct in_addr a {};
+    if (inet_pton(AF_INET, text.c_str(), &a) != 1 || a.s_addr == 0)
+      continue;  // IPv6, or nothing useful
+    ESP_LOGD(TAG, "Own address %s", text.c_str());
+    // /24 is an assumption, but it is the one every domestic LAN meets, and
+    // the limited broadcast is still sent alongside for the cases it does not.
+    return (a.s_addr & htonl(0xFFFFFF00)) | htonl(0x000000FF);
   }
-  ::close(s);
-  if (local == 0) {
-    ESP_LOGW(TAG, "Could not determine our own IP for the subnet broadcast");
-    return 0;
-  }
-  char me[INET_ADDRSTRLEN] = {0};
-  inet_ntop(AF_INET, &local, me, sizeof(me));
-  ESP_LOGD(TAG, "Own address %s", me);
-  // /24 is an assumption, but it is the assumption every domestic LAN meets,
-  // and the limited broadcast above still covers the cases where it does not.
-  return (local & htonl(0xFFFFFF00)) | htonl(0x000000FF);
+  ESP_LOGW(TAG, "No IPv4 address yet - cannot compute the subnet broadcast");
+  return 0;
 }
 
 bool SolarmanMinimal::discover_host() {
