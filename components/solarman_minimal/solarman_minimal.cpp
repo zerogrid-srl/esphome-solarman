@@ -3,6 +3,9 @@
 #include "esphome/core/hal.h"
 #include "esphome/core/application.h"
 #include "esphome/components/wifi/wifi_component.h"
+#ifdef USE_ESP32
+#include <esp_netif.h>
+#endif
 
 #include <sys/socket.h>
 #include <sys/select.h>
@@ -341,28 +344,30 @@ void SolarmanMinimal::scan_registers() {
 // socket sends no packet: it only asks the stack which source address it would
 // use, which is the portable way to learn our IP without an ESPHome API that
 // differs between frameworks.
-// The /24 broadcast for the network we are on.
+// The broadcast address of the network we are on.
 //
-// The first attempt at this used connect() on a UDP socket and getsockname()
-// to learn our own address - the usual portable trick. It does not work on
-// LWIP: getsockname() on a socket that was never explicitly bound returns
-// 0.0.0.0, so the subnet broadcast was skipped and a whole field test proved
-// nothing. ESPHome's WiFi component knows the address for certain; the string
-// round trip avoids depending on how IPAddress stores it, which differs
-// between the IPv6 and IPv4-only builds.
+// Two earlier attempts got this wrong in instructive ways. connect() plus
+// getsockname() is the usual portable trick and returns 0.0.0.0 on LWIP for a
+// socket that was never bound. ESPHome's network::IPAddress does expose str(),
+// but only in the variant compiled with IPv6 enabled - so the code built here
+// and failed at a customer whose build has it off.
+//
+// esp_netif is neither: it is stable across ESPHome versions, and it hands
+// back the netmask as well, so the broadcast is the real one instead of a /24
+// assumed on the network's behalf.
 uint32_t SolarmanMinimal::subnet_broadcast() {
-  for (auto &ip : wifi::global_wifi_component->get_ip_addresses()) {
-    if (!ip.is_set())
-      continue;
-    std::string text = ip.str();
-    struct in_addr a {};
-    if (inet_pton(AF_INET, text.c_str(), &a) != 1 || a.s_addr == 0)
-      continue;  // IPv6, or nothing useful
-    ESP_LOGD(TAG, "Own address %s", text.c_str());
-    // /24 is an assumption, but it is the one every domestic LAN meets, and
-    // the limited broadcast is still sent alongside for the cases it does not.
-    return (a.s_addr & htonl(0xFFFFFF00)) | htonl(0x000000FF);
+#ifdef USE_ESP32
+  esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  esp_netif_ip_info_t info{};
+  if (netif != nullptr && esp_netif_get_ip_info(netif, &info) == ESP_OK && info.ip.addr != 0) {
+    uint32_t bcast = (info.ip.addr & info.netmask.addr) | ~info.netmask.addr;
+    char a[INET_ADDRSTRLEN] = {0}, m[INET_ADDRSTRLEN] = {0};
+    inet_ntop(AF_INET, &info.ip.addr, a, sizeof(a));
+    inet_ntop(AF_INET, &info.netmask.addr, m, sizeof(m));
+    ESP_LOGD(TAG, "Own address %s netmask %s", a, m);
+    return bcast;
   }
+#endif
   ESP_LOGW(TAG, "No IPv4 address yet - cannot compute the subnet broadcast");
   return 0;
 }
