@@ -397,12 +397,39 @@ bool SolarmanMinimal::verify_candidate(uint32_t addr) {
   std::vector<uint16_t> probe;
   // One register is enough to tell a Solarman logger from anything else that
   // happens to listen on 8899.
-  bool ok = read_registers(REG_BATCH2_START, 1, probe);
-  if (ok) {
+  if (read_registers(REG_BATCH2_START, 1, probe)) {
     ESP_LOGI(TAG, "Logger confirmed at %s", host_str().c_str());
     save_host();
     return true;
   }
+
+  // No Modbus payload came back. If we do not know the serial then the request
+  // went out carrying zero, which these loggers refuse - but they refuse it
+  // with a V5 frame of their own, and that frame names them. Take the serial
+  // from it and ask again properly. This is what makes the scan genuinely
+  // zero-config: address and serial both come from the dongle.
+  if (serial_ == 0) {
+    uint32_t announced = frame_serial(last_reply_);
+    if (announced != 0) {
+      serial_ = announced;
+      SolarmanSerialPrefs sp{serial_};
+      serial_prefs_.save(&sp);
+      prefs_ = global_preferences->make_preference<SolarmanPrefs>(serial_);
+      global_preferences->sync();
+      ESP_LOGI(TAG, "Logger announced serial %" PRIu32 " - retrying the read",
+               serial_);
+      if (read_registers(REG_BATCH2_START, 1, probe)) {
+        ESP_LOGI(TAG, "Logger confirmed at %s", host_str().c_str());
+        save_host();
+        return true;
+      }
+      ESP_LOGW(TAG, "Still no answer with the announced serial");
+    } else {
+      ESP_LOGW(TAG, "Reply carried no usable serial (%u bytes)",
+               (unsigned) last_reply_.size());
+    }
+  }
+
   host_addr_ = saved;
   return false;
 }
@@ -789,6 +816,7 @@ bool SolarmanMinimal::read_registers(uint16_t start, uint8_t count, std::vector<
   }
   ::close(fd);
 
+  last_reply_ = resp;
   if (!parse_v5_response(resp, out)) {
     note_error("V5", resp.empty() ? 0 : -1);
     return false;
@@ -875,6 +903,14 @@ std::vector<uint8_t> SolarmanMinimal::build_v5_request(uint16_t reg_start, uint8
 }
 
 // ── V5 response parser ────────────────────────────────────────────────────
+
+uint32_t SolarmanMinimal::frame_serial(const std::vector<uint8_t> &frame) {
+  // 0xA5 [len 2] [control 2] [sequence 2] [serial 4] ... [checksum] 0x15
+  if (frame.size() < 13 || frame.front() != 0xA5 || frame.back() != 0x15)
+    return 0;
+  return (uint32_t) frame[7] | ((uint32_t) frame[8] << 8) |
+         ((uint32_t) frame[9] << 16) | ((uint32_t) frame[10] << 24);
+}
 
 bool SolarmanMinimal::parse_v5_response(const std::vector<uint8_t> &resp, std::vector<uint16_t> &regs) {
   if (resp.size() < 20) {

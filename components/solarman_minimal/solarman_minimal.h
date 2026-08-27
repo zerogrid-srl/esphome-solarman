@@ -213,6 +213,13 @@ class SolarmanMinimal : public PollingComponent {
   bool read_registers(uint16_t start, uint8_t count, std::vector<uint16_t> &out);
   std::vector<uint8_t> build_v5_request(uint16_t reg_start, uint8_t reg_count);
   bool parse_v5_response(const std::vector<uint8_t> &resp, std::vector<uint16_t> &regs);
+  // The logger's own serial, taken from any V5 frame it sends back - including
+  // one that rejects our request. Offset 7, four bytes, low byte first.
+  static uint32_t frame_serial(const std::vector<uint8_t> &frame);
+  // Kept so a rejected reply can still be inspected after read_registers
+  // returns false. Without it the only evidence of the dongle's identity is
+  // discarded on the way out.
+  std::vector<uint8_t> last_reply_;
   void publish_signed(sensor::Sensor *s, uint16_t raw);
   uint16_t crc16(const uint8_t *data, size_t len);
 };
