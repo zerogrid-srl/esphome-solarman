@@ -32,26 +32,30 @@ static const uint32_t DISCOVERY_RETRY  = 300000;  // ms between failed attempts
 // with 11 already spoken for by api, captive_portal and web_server, so a wide
 // fan-out would starve them and take down the API instead of finding a dongle.
 static const uint8_t  SCAN_PARALLEL = 4;
-static const uint32_t SCAN_WAIT      = 250;   // ms per batch
-// A user-requested sweep runs from loop() instead of once per poll, so
-// running back-to-back at the SAME per-batch wait as the background sweep is
-// what makes it fast - no separate, shorter timing needed.
+// On-demand only: the scan used to also run a few addresses per poll forever
+// in the background, looking for a logger it did not have. That meant
+// opening TCP connections to every host on the LAN, repeatedly, for as long
+// as the device ran unconfigured - real traffic on someone else's network for
+// no benefit to them. It now runs a single full sweep only when start_scan()
+// is called (a button press), and a failed sweep is left for a person to
+// retry rather than retried automatically.
 //
-// A 120 ms value was tried first and field-tested broken: a full sweep
+// 500 ms per batch, not 250: a real dongle in the field was seen to take
+// several seconds to accept a TCP connection while it was busy polling the
+// inverter over RS485, and a batch that gets no response within its window
+// is gone for that sweep - there is no second pass to catch it. 250 ms (the
+// value a background sweep had used, where a miss just waits for the next
+// cycle) let a single manual sweep walk right past a slow-to-answer logger.
+// 500 ms trades a few more seconds of total sweep time (about 32 s worst
+// case for a /24) for not missing the logger on the one pass that counts.
+//
+// A 120 ms value was tried before that and was worse still: a full sweep
 // finished in ~12 s but every "open" port it reported was bogus (including
-// the ESP32's own address), and the real logger was never found. The
-// non-blocking connect() needs time to actually resolve - ARP plus the TCP
-// handshake - and 120 ms was not enough on this network. Closing the socket
-// while a handshake was still in flight left stale state that the next
-// batch's select() misread as a hit. 250 ms is the value already proven in
-// the field for the background sweep (found the real logger, read every
-// register, at the customer's site) - reusing it here trades a few seconds
-// of total time (about 16 s instead of 10 for a /24) for a scan that
-// actually finds what it is looking for.
-static const uint32_t SCAN_WAIT_FAST = SCAN_WAIT;
-// 254 addresses at 4 per poll is about ten minutes on a 10 s interval. Slow,
-// but it runs once and costs a quarter second per cycle - and unlike the UDP
-// probe it does not depend on the dongle implementing anything.
+// the ESP32's own address), and the real logger was never found - the
+// non-blocking connect() needs time to actually resolve (ARP plus the TCP
+// handshake), and closing the socket while a handshake was still in flight
+// left stale state that the next batch's select() misread as a hit.
+static const uint32_t SCAN_WAIT = 500;
 // Re-run discovery only after this many consecutive read failures, so a single
 // dropped packet does not throw away a working IP.
 static const uint8_t MAX_FAILURES = 3;
@@ -82,7 +86,14 @@ class SolarmanMinimal : public PollingComponent {
   enum ScanState : uint8_t { SCAN_IDLE = 0, SCAN_RUNNING = 1,
                              SCAN_FOUND = 2, SCAN_FAILED = 3 };
 
+  // tcp_scan_ used to gate an automatic background sweep; now it gates
+  // whether a manual one is allowed to start at all, so the YAML setting
+  // still means something instead of becoming dead configuration.
   void start_scan() {
+    if (!tcp_scan_) {
+      ESP_LOGW("solarman", "Search requested but tcp_scan is disabled in the config");
+      return;
+    }
     forget_all();
     scan_next_ = 1;
     scan_wrapped_ = false;

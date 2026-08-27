@@ -189,9 +189,11 @@ void SolarmanMinimal::set_serial_from_text(const std::string &s) {
 
 // ── update ────────────────────────────────────────────────────────────────
 
-// Fast scanning happens here, not in update(): one batch per loop pass. Each
-// batch blocks for SCAN_WAIT_FAST, so everything else on the device runs
-// between batches rather than being shut out for the whole sweep.
+// The manual scan runs here, not in update(): one batch per loop pass. Each
+// batch blocks for SCAN_WAIT, so everything else on the device runs between
+// batches rather than being shut out for the whole sweep. A sweep that finds
+// nothing is left failed - the person who pressed the button decides whether
+// to try again, rather than the device retrying on its own.
 void SolarmanMinimal::loop() {
   if (!scan_fast_)
     return;
@@ -244,11 +246,10 @@ void SolarmanMinimal::update() {
                  (unsigned) (DISCOVERY_RETRY / 1000));
     }
 
-    // The background sweep carries on between probes, one small batch per
-    // poll - unless a user-requested search is already running flat out in
-    // loop(), in which case two sweeps would fight over scan_next_.
-    if (!has_host() && tcp_scan_ && !scan_fast_)
-      tcp_scan_step();
+    // No automatic subnet scan here: it used to run a few addresses every
+    // poll, forever, while unconfigured - real TCP connections to every host
+    // on someone else's LAN, indefinitely. The scan now runs only from
+    // start_scan() (see loop()), a single sweep per button press.
 
     // Still nothing to talk to, or nothing to identify ourselves with.
     if (!has_host() || serial_ == 0)
@@ -417,9 +418,10 @@ uint32_t SolarmanMinimal::subnet_broadcast() {
 // implement anything: find who has port 8899 open. Five dongles across four
 // sites never answered a UDP probe, while every one of them served 8899.
 //
-// Incremental by design. One batch per poll, never blocking the main loop for
-// more than SCAN_WAIT, watchdog fed throughout - the lesson of a device that
-// rebooted every 30 seconds because a single connect() was left blocking.
+// Incremental by design. One batch per loop pass, never blocking the main
+// loop for more than SCAN_WAIT, watchdog fed throughout - the lesson of a
+// device that rebooted every 30 seconds because a single connect() was left
+// blocking.
 
 bool SolarmanMinimal::verify_candidate(uint32_t addr) {
   uint32_t saved = host_addr_;
@@ -449,13 +451,25 @@ bool SolarmanMinimal::verify_candidate(uint32_t addr) {
       global_preferences->sync();
       ESP_LOGI(TAG, "Logger announced serial %" PRIu32 " - retrying the read",
                serial_);
-      if (read_registers(REG_BATCH2_START, 1, probe)) {
-        ESP_LOGI(TAG, "Logger confirmed at %s", host_str().c_str());
-        clear_error();
-        save_host();
-        return true;
+      // A genuine V5 frame is a much stronger signal than a merely-open
+      // port - nothing else on this LAN has ever produced one - so a
+      // candidate that gets this far is worth a few tries, not one. The
+      // dongle has been seen to take several seconds to answer while busy
+      // polling the inverter over RS485; each attempt already carries its
+      // own multi-second connect/read budget, so three attempts is the
+      // several-seconds-per-try, up-to-half-a-minute-total investment this
+      // address has earned by proving it is the real logger, before the
+      // sweep moves on and that chance is gone for this pass.
+      for (uint8_t attempt = 1; attempt <= 3; attempt++) {
+        if (read_registers(REG_BATCH2_START, 1, probe)) {
+          ESP_LOGI(TAG, "Logger confirmed at %s", host_str().c_str());
+          clear_error();
+          save_host();
+          return true;
+        }
+        ESP_LOGW(TAG, "Still no answer with the announced serial (try %u/3)",
+                 (unsigned) attempt);
       }
-      ESP_LOGW(TAG, "Still no answer with the announced serial");
     } else {
       ESP_LOGW(TAG, "Reply carried no usable serial (%u bytes)",
                (unsigned) last_reply_.size());
@@ -520,7 +534,7 @@ bool SolarmanMinimal::tcp_scan_step() {
   }
 
   if (count > 0) {
-    uint32_t deadline = millis() + (scan_fast_ ? SCAN_WAIT_FAST : SCAN_WAIT);
+    uint32_t deadline = millis() + SCAN_WAIT;
     while (millis() < deadline && found == 0) {
       App.feed_wdt();
       fd_set wfds;
@@ -754,6 +768,15 @@ uint32_t SolarmanMinimal::parse_discovery_serial(const char *reply) {
 // ── TCP register read ─────────────────────────────────────────────────────
 
 bool SolarmanMinimal::read_registers(uint16_t start, uint8_t count, std::vector<uint16_t> &out) {
+  // Cleared up front, not just overwritten at the end: every early return
+  // below (socket(), connect(), send() failing) used to leave last_reply_
+  // holding whatever the PREVIOUS call - on a different address - had
+  // received. During the scan that meant a candidate that never answered at
+  // all could inherit the real logger's serial from an earlier, unrelated
+  // read and have it misreported as its own "announced serial" a few lines
+  // down in verify_candidate().
+  last_reply_.clear();
+
   int fd = ::socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
     ESP_LOGW(TAG, "TCP socket() failed: %d", errno);
