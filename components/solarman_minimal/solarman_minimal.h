@@ -32,11 +32,23 @@ static const uint32_t DISCOVERY_RETRY  = 300000;  // ms between failed attempts
 // with 11 already spoken for by api, captive_portal and web_server, so a wide
 // fan-out would starve them and take down the API instead of finding a dongle.
 static const uint8_t  SCAN_PARALLEL = 4;
-static const uint32_t SCAN_WAIT      = 250;   // ms per batch, background
-// A user-requested sweep runs from loop() instead of once per poll, so the
-// wait per batch is what sets the total: 64 batches at 120 ms is about ten
-// seconds for a /24, against ten minutes in the background.
-static const uint32_t SCAN_WAIT_FAST = 120;
+static const uint32_t SCAN_WAIT      = 250;   // ms per batch
+// A user-requested sweep runs from loop() instead of once per poll, so
+// running back-to-back at the SAME per-batch wait as the background sweep is
+// what makes it fast - no separate, shorter timing needed.
+//
+// A 120 ms value was tried first and field-tested broken: a full sweep
+// finished in ~12 s but every "open" port it reported was bogus (including
+// the ESP32's own address), and the real logger was never found. The
+// non-blocking connect() needs time to actually resolve - ARP plus the TCP
+// handshake - and 120 ms was not enough on this network. Closing the socket
+// while a handshake was still in flight left stale state that the next
+// batch's select() misread as a hit. 250 ms is the value already proven in
+// the field for the background sweep (found the real logger, read every
+// register, at the customer's site) - reusing it here trades a few seconds
+// of total time (about 16 s instead of 10 for a /24) for a scan that
+// actually finds what it is looking for.
+static const uint32_t SCAN_WAIT_FAST = SCAN_WAIT;
 // 254 addresses at 4 per poll is about ten minutes on a 10 s interval. Slow,
 // but it runs once and costs a quarter second per cycle - and unlike the UDP
 // probe it does not depend on the dongle implementing anything.
