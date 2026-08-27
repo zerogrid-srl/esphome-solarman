@@ -195,34 +195,40 @@ void SolarmanMinimal::update() {
     return;
   }
 
-  // Discovery supplies whichever of the two is missing: the address, the
-  // serial, or both. Nothing has to be configured for this to work.
+  // Find the logger if we do not have it. Two mechanisms, tried in order and
+  // both optional: the UDP probe, which no dongle has ever answered, and the
+  // subnet scan, which has.
+  //
+  // Rewritten because the first version ran the UDP probe even after the scan
+  // had just succeeded - a wasted second and a "not found on LAN" warning
+  // logged immediately below "Logger confirmed at", which reads like a
+  // contradiction.
   if (serial_ == 0 || !has_host()) {
-    // A failed attempt is not retried on the next poll. Discovery blocks the
-    // main loop while it waits, and repeating it every 10 s cost three seconds
-    // in ten on a device that also runs a BLE stack - for a probe that four
-    // sites in a row never answered.
     uint32_t now = millis();
-    if (last_discovery_ms_ != 0 && (now - last_discovery_ms_) < DISCOVERY_RETRY) {
+    // A failed probe is not retried on the next poll: it blocks the main loop
+    // while it waits, and at a 10 s interval that spent a second in ten on a
+    // device that also runs a BLE stack.
+    bool backing_off = last_discovery_ms_ != 0 &&
+                       (now - last_discovery_ms_) < DISCOVERY_RETRY;
+    if (backing_off) {
       ESP_LOGD(TAG, "Discovery backing off - %u s to the next attempt",
                (unsigned) ((DISCOVERY_RETRY - (now - last_discovery_ms_)) / 1000));
-      if (tcp_scan_ && !has_host() && tcp_scan_step())
-        last_discovery_ms_ = 0;  // found it; stop backing off
+    } else {
+      last_discovery_ms_ = now;
+      if (discover_host())
+        last_discovery_ms_ = 0;
       else
-        return;
+        ESP_LOGW(TAG, "Discovery failed - next attempt in %u s",
+                 (unsigned) (DISCOVERY_RETRY / 1000));
     }
-    last_discovery_ms_ = now;
-    if (!discover_host()) {
-      ESP_LOGW(TAG, "Discovery failed - next attempt in %u s",
-               (unsigned) (DISCOVERY_RETRY / 1000));
-      // The UDP probe backs off for five minutes; the scan carries on in the
-      // meantime, one small batch per poll. It is the only one of the two that
-      // has ever had a chance of working on these dongles.
-      if (tcp_scan_ && !has_host())
-        tcp_scan_step();
+
+    // The scan carries on between probes, one small batch per poll.
+    if (!has_host() && tcp_scan_)
+      tcp_scan_step();
+
+    // Still nothing to talk to, or nothing to identify ourselves with.
+    if (!has_host() || serial_ == 0)
       return;
-    }
-    last_discovery_ms_ = 0;
   }
 
   // ── Batch 2 first: grid, load, battery, PV power ────────────────────────
@@ -399,6 +405,7 @@ bool SolarmanMinimal::verify_candidate(uint32_t addr) {
   // happens to listen on 8899.
   if (read_registers(REG_BATCH2_START, 1, probe)) {
     ESP_LOGI(TAG, "Logger confirmed at %s", host_str().c_str());
+    clear_error();
     save_host();
     return true;
   }
@@ -420,6 +427,7 @@ bool SolarmanMinimal::verify_candidate(uint32_t addr) {
                serial_);
       if (read_registers(REG_BATCH2_START, 1, probe)) {
         ESP_LOGI(TAG, "Logger confirmed at %s", host_str().c_str());
+        clear_error();
         save_host();
         return true;
       }
