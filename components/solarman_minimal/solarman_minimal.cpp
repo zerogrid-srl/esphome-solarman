@@ -209,6 +209,12 @@ void SolarmanMinimal::loop() {
   if (scan_wrapped_) {
     scan_fast_ = false;
     scan_state_ = SCAN_FAILED;
+    // Nothing found - put back whatever start_scan() had before it cleared
+    // host_addr_/serial_ to zero for the sweep. A search that finds nothing
+    // should report failure, not also break a connection that was already
+    // working.
+    host_addr_ = scan_saved_host_;
+    serial_ = scan_saved_serial_;
     ESP_LOGW(TAG, "Search finished: nothing answering on port %u", SOLARMAN_PORT);
   }
 }

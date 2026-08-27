@@ -89,12 +89,25 @@ class SolarmanMinimal : public PollingComponent {
   // tcp_scan_ used to gate an automatic background sweep; now it gates
   // whether a manual one is allowed to start at all, so the YAML setting
   // still means something instead of becoming dead configuration.
+  //
+  // In-RAM reset only - deliberately NOT forget_all(). This runs from a
+  // screen touch, and forget_all()'s two synchronous NVS flushes stalled
+  // LVGL's touch handling for long enough that the resumed touch looked like
+  // a drag to the tileview's gesture detector, which read it as a swipe and
+  // threw the person onto a different tile before they ever saw the scan
+  // start. The old address and serial are kept (not flashed over) so a
+  // search that finds nothing leaves a previously-working connection alone;
+  // see the restore in loop() on SCAN_FAILED.
   void start_scan() {
     if (!tcp_scan_) {
       ESP_LOGW("solarman", "Search requested but tcp_scan is disabled in the config");
       return;
     }
-    forget_all();
+    scan_saved_host_ = host_addr_;
+    scan_saved_serial_ = serial_;
+    host_override_ = false;
+    host_addr_ = 0;
+    serial_ = 0;
     scan_next_ = 1;
     scan_wrapped_ = false;
     scan_fast_ = true;
@@ -227,6 +240,10 @@ class SolarmanMinimal : public PollingComponent {
   bool tcp_scan_{false};
   bool scan_fast_{false};
   uint8_t scan_state_{0};
+  // Whatever start_scan() had before it reset host_addr_/serial_ to zero,
+  // restored in loop() if the search finds nothing.
+  uint32_t scan_saved_host_{0};
+  uint32_t scan_saved_serial_{0};
   uint8_t scan_next_{1};       // host octet to try next, 1..254
   bool scan_wrapped_{false};   // a full sweep has completed without a find
   ESPPreferenceObject prefs_;
