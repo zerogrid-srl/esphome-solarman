@@ -32,7 +32,11 @@ static const uint32_t DISCOVERY_RETRY  = 300000;  // ms between failed attempts
 // with 11 already spoken for by api, captive_portal and web_server, so a wide
 // fan-out would starve them and take down the API instead of finding a dongle.
 static const uint8_t  SCAN_PARALLEL = 4;
-static const uint32_t SCAN_WAIT     = 250;   // ms per batch
+static const uint32_t SCAN_WAIT      = 250;   // ms per batch, background
+// A user-requested sweep runs from loop() instead of once per poll, so the
+// wait per batch is what sets the total: 64 batches at 120 ms is about ten
+// seconds for a /24, against ten minutes in the background.
+static const uint32_t SCAN_WAIT_FAST = 120;
 // 254 addresses at 4 per poll is about ten minutes on a 10 s interval. Slow,
 // but it runs once and costs a quarter second per cycle - and unlike the UDP
 // probe it does not depend on the dongle implementing anything.
@@ -51,6 +55,7 @@ struct SolarmanSerialPrefs {
 class SolarmanMinimal : public PollingComponent {
  public:
   void setup() override;
+  void loop() override;
   void update() override;
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::AFTER_WIFI; }
@@ -60,6 +65,28 @@ class SolarmanMinimal : public PollingComponent {
   void set_serial_from_text(const std::string &s);
   void set_host(const std::string &host);
   void set_tcp_scan(bool enabled) { tcp_scan_ = enabled; }
+
+  // ── On-demand search, for a person who is watching ──────────────────────
+  enum ScanState : uint8_t { SCAN_IDLE = 0, SCAN_RUNNING = 1,
+                             SCAN_FOUND = 2, SCAN_FAILED = 3 };
+
+  void start_scan() {
+    forget_all();
+    scan_next_ = 1;
+    scan_wrapped_ = false;
+    scan_fast_ = true;
+    scan_state_ = SCAN_RUNNING;
+    ESP_LOGI("solarman", "Search started");
+  }
+
+  uint8_t scan_state() const { return scan_state_; }
+  // .1 is 0%, .254 is 100% - the caller asked for it in those terms.
+  uint8_t scan_percent() const {
+    if (scan_next_ <= 1)
+      return 0;
+    uint16_t done = (uint16_t) scan_next_ - 1;
+    return (uint8_t) ((done * 100u) / 253u);
+  }
 
   // Wipe everything the component remembers: address AND serial.
   //
@@ -175,6 +202,8 @@ class SolarmanMinimal : public PollingComponent {
   uint8_t consecutive_failures_{0};
   uint32_t last_discovery_ms_{0};
   bool tcp_scan_{false};
+  bool scan_fast_{false};
+  uint8_t scan_state_{0};
   uint8_t scan_next_{1};       // host octet to try next, 1..254
   bool scan_wrapped_{false};   // a full sweep has completed without a find
   ESPPreferenceObject prefs_;

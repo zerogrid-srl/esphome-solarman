@@ -189,6 +189,28 @@ void SolarmanMinimal::set_serial_from_text(const std::string &s) {
 
 // ── update ────────────────────────────────────────────────────────────────
 
+// Fast scanning happens here, not in update(): one batch per loop pass. Each
+// batch blocks for SCAN_WAIT_FAST, so everything else on the device runs
+// between batches rather than being shut out for the whole sweep.
+void SolarmanMinimal::loop() {
+  if (!scan_fast_)
+    return;
+  if (!wifi::global_wifi_component->is_connected())
+    return;
+
+  if (tcp_scan_step()) {
+    scan_fast_ = false;
+    scan_state_ = SCAN_FOUND;
+    ESP_LOGI(TAG, "Search finished: %s", status_line().c_str());
+    return;
+  }
+  if (scan_wrapped_) {
+    scan_fast_ = false;
+    scan_state_ = SCAN_FAILED;
+    ESP_LOGW(TAG, "Search finished: nothing answering on port %u", SOLARMAN_PORT);
+  }
+}
+
 void SolarmanMinimal::update() {
   if (!wifi::global_wifi_component->is_connected()) {
     ESP_LOGD(TAG, "WiFi down - skipping poll");
@@ -222,8 +244,10 @@ void SolarmanMinimal::update() {
                  (unsigned) (DISCOVERY_RETRY / 1000));
     }
 
-    // The scan carries on between probes, one small batch per poll.
-    if (!has_host() && tcp_scan_)
+    // The background sweep carries on between probes, one small batch per
+    // poll - unless a user-requested search is already running flat out in
+    // loop(), in which case two sweeps would fight over scan_next_.
+    if (!has_host() && tcp_scan_ && !scan_fast_)
       tcp_scan_step();
 
     // Still nothing to talk to, or nothing to identify ourselves with.
@@ -496,7 +520,7 @@ bool SolarmanMinimal::tcp_scan_step() {
   }
 
   if (count > 0) {
-    uint32_t deadline = millis() + SCAN_WAIT;
+    uint32_t deadline = millis() + (scan_fast_ ? SCAN_WAIT_FAST : SCAN_WAIT);
     while (millis() < deadline && found == 0) {
       App.feed_wdt();
       fd_set wfds;
