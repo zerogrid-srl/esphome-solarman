@@ -413,14 +413,21 @@ bool SolarmanMinimal::tcp_scan_step() {
     return false;
   uint32_t network = bcast & htonl(0xFFFFFF00);
 
+  uint32_t found = 0;
   int fds[SCAN_PARALLEL];
   uint32_t addrs[SCAN_PARALLEL];
   int count = 0, maxfd = -1;
+  uint32_t began = millis();
+  uint8_t first = scan_next_;
+  int refused = 0;
 
   for (int i = 0; i < SCAN_PARALLEL && scan_next_ < 255; i++) {
-    uint32_t addr = network | htonl(scan_next_);
+    uint32_t addr = network | htonl((uint32_t) scan_next_);
     scan_next_++;
-    if (addr == subnet_broadcast() || addr == network)
+    // bcast is computed once per batch now. Calling subnet_broadcast() in here
+    // logged our own address four extra times per batch and asked the network
+    // stack the same question five times for no reason.
+    if (addr == bcast || addr == network)
       continue;
 
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -439,6 +446,10 @@ bool SolarmanMinimal::tcp_scan_step() {
     dest.sin_port = htons(SOLARMAN_PORT);
     int rc = ::connect(fd, (struct sockaddr *) &dest, sizeof(dest));
     if (rc < 0 && errno != EINPROGRESS) {
+      // Counted, not ignored. A batch where every connect is rejected up front
+      // looks exactly like a batch that ran and found nothing, and telling
+      // those apart is the whole point of a sweep.
+      refused++;
       ::close(fd);
       continue;
     }
@@ -449,7 +460,6 @@ bool SolarmanMinimal::tcp_scan_step() {
     count++;
   }
 
-  uint32_t found = 0;
   if (count > 0) {
     uint32_t deadline = millis() + SCAN_WAIT;
     while (millis() < deadline && found == 0) {
@@ -478,6 +488,15 @@ bool SolarmanMinimal::tcp_scan_step() {
     for (int i = 0; i < count; i++)
       ::close(fds[i]);
   }
+
+  // One line per batch, so a sweep that is not actually sweeping is visible
+  // immediately rather than after ten minutes of silence.
+  // INFO, not DEBUG: this is the line that says whether a sweep is actually
+  // sweeping, and a config at INFO would have the DEBUG version stripped at
+  // compile time - leaving a silent scan that looks identical to a broken one.
+  ESP_LOGI(TAG, "scan: .%u-.%u  %d open attempts, %d refused at once, %u ms%s",
+           (unsigned) first, (unsigned) (scan_next_ - 1), count, refused,
+           (unsigned) (millis() - began), found != 0 ? "  HIT" : "");
 
   if (scan_next_ >= 255) {
     scan_next_ = 1;

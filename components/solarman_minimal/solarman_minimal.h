@@ -60,15 +60,45 @@ class SolarmanMinimal : public PollingComponent {
   void set_serial_from_text(const std::string &s);
   void set_host(const std::string &host);
   void set_tcp_scan(bool enabled) { tcp_scan_ = enabled; }
+
+  // Wipe everything the component remembers: address AND serial.
+  //
+  // Clearing only the address is not enough to repeat a discovery test: with a
+  // serial still in flash the probe goes out looking for that one logger
+  // instead of adopting whatever answers, so it is a different test from the
+  // one a fresh device performs. The serial cannot be removed over the air any
+  // other way - NVS survives an OTA - so without this the only reset is a
+  // cable and an erase.
+  void forget_all() {
+    clear_host();
+    serial_ = 0;
+    SolarmanSerialPrefs blank{};
+    serial_prefs_.save(&blank);
+    global_preferences->sync();
+    ESP_LOGI("solarman", "Configuration forgotten - address and serial cleared");
+  }
   // Emptying the address field has to actually release the address. Ignoring
   // an empty value left the override in place until the next reboot, which
   // looks exactly like the setting not working.
   void clear_host() {
-    if (!host_override_)
-      return;
+    // Forget the address wherever it came from, and forget it in flash too.
+    //
+    // This used to return early unless host_override_ was set, so it only
+    // undid a manually typed address - clearing the field did nothing at all
+    // once discovery or the scan had found the logger, which is exactly when
+    // someone wants to re-run the search. And the cached copy survived a
+    // reboot regardless, so the search never restarted.
     host_override_ = false;
     host_addr_ = 0;
     last_discovery_ms_ = 0;
+    scan_next_ = 1;
+    scan_wrapped_ = false;
+    if (serial_ != 0) {
+      SolarmanPrefs blank{};
+      prefs_.save(&blank);
+      global_preferences->sync();
+    }
+    ESP_LOGI("solarman", "Address forgotten - discovery will start over");
   }
   std::string host_str() const;
 
