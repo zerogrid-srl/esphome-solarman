@@ -487,86 +487,99 @@ bool SolarmanMinimal::verify_candidate(uint32_t addr) {
 }
 
 bool SolarmanMinimal::tcp_scan_step() {
-  uint32_t bcast = subnet_broadcast();
-  if (bcast == 0)
-    return false;
-  uint32_t network = bcast & htonl(0xFFFFFF00);
+  if (!scan_batch_open_) {
+    // Launch a batch: issue the non-blocking connects and return immediately
+    // rather than waiting here for them to resolve - that wait is what used
+    // to eat the CPU for up to SCAN_WAIT every single call.
+    uint32_t bcast = subnet_broadcast();
+    if (bcast == 0)
+      return false;
+    uint32_t network = bcast & htonl(0xFFFFFF00);
 
-  uint32_t found = 0;
-  int fds[SCAN_PARALLEL];
-  uint32_t addrs[SCAN_PARALLEL];
-  int count = 0, maxfd = -1;
-  uint32_t began = millis();
-  uint8_t first = scan_next_;
-  int refused = 0;
+    scan_batch_count_ = 0;
+    scan_batch_maxfd_ = -1;
+    scan_batch_refused_ = 0;
+    scan_batch_began_ = millis();
+    scan_batch_first_ = scan_next_;
 
-  for (int i = 0; i < SCAN_PARALLEL && scan_next_ < 255; i++) {
-    uint32_t addr = network | htonl((uint32_t) scan_next_);
-    scan_next_++;
-    // bcast is computed once per batch now. Calling subnet_broadcast() in here
-    // logged our own address four extra times per batch and asked the network
-    // stack the same question five times for no reason.
-    if (addr == bcast || addr == network)
-      continue;
+    for (int i = 0; i < SCAN_PARALLEL && scan_next_ < 255; i++) {
+      uint32_t addr = network | htonl((uint32_t) scan_next_);
+      scan_next_++;
+      if (addr == bcast || addr == network)
+        continue;
 
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-      // The pool is exhausted - stop asking for more this round rather than
-      // spinning on a failure we cannot fix.
-      ESP_LOGW(TAG, "scan: no sockets available (%d)", errno);
-      break;
+      int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+      if (fd < 0) {
+        // The pool is exhausted - stop asking for more this round rather than
+        // spinning on a failure we cannot fix.
+        ESP_LOGW(TAG, "scan: no sockets available (%d)", errno);
+        break;
+      }
+      int flags = ::fcntl(fd, F_GETFL, 0);
+      ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+      struct sockaddr_in dest {};
+      dest.sin_family = AF_INET;
+      dest.sin_addr.s_addr = addr;
+      dest.sin_port = htons(SOLARMAN_PORT);
+      int rc = ::connect(fd, (struct sockaddr *) &dest, sizeof(dest));
+      if (rc < 0 && errno != EINPROGRESS) {
+        // Counted, not ignored. A batch where every connect is rejected up
+        // front looks exactly like a batch that ran and found nothing, and
+        // telling those apart is the whole point of a sweep.
+        scan_batch_refused_++;
+        ::close(fd);
+        continue;
+      }
+      scan_batch_fds_[scan_batch_count_] = fd;
+      scan_batch_addrs_[scan_batch_count_] = addr;
+      if (fd > scan_batch_maxfd_)
+        scan_batch_maxfd_ = fd;
+      scan_batch_count_++;
     }
-    int flags = ::fcntl(fd, F_GETFL, 0);
-    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
-    struct sockaddr_in dest {};
-    dest.sin_family = AF_INET;
-    dest.sin_addr.s_addr = addr;
-    dest.sin_port = htons(SOLARMAN_PORT);
-    int rc = ::connect(fd, (struct sockaddr *) &dest, sizeof(dest));
-    if (rc < 0 && errno != EINPROGRESS) {
-      // Counted, not ignored. A batch where every connect is rejected up front
-      // looks exactly like a batch that ran and found nothing, and telling
-      // those apart is the whole point of a sweep.
-      refused++;
-      ::close(fd);
-      continue;
-    }
-    fds[count] = fd;
-    addrs[count] = addr;
-    if (fd > maxfd)
-      maxfd = fd;
-    count++;
+    scan_batch_deadline_ = millis() + SCAN_WAIT;
+    scan_batch_open_ = true;
+    if (scan_batch_count_ > 0)
+      return false;  // launched; poll it on the next call(s)
+    // Nothing to wait on (all refused, or the sweep just wrapped) - fall
+    // through to close this empty batch out immediately below.
   }
 
-  if (count > 0) {
-    uint32_t deadline = millis() + SCAN_WAIT;
-    while (millis() < deadline && found == 0) {
-      App.feed_wdt();
-      fd_set wfds;
-      FD_ZERO(&wfds);
-      for (int i = 0; i < count; i++)
-        FD_SET(fds[i], &wfds);
-      struct timeval sel {};
-      sel.tv_sec = 0;
-      sel.tv_usec = 50000;  // 50 ms per pass, so the watchdog is fed often
-      if (::select(maxfd + 1, nullptr, &wfds, nullptr, &sel) <= 0)
-        continue;
-      for (int i = 0; i < count; i++) {
-        if (!FD_ISSET(fds[i], &wfds))
+  // Poll the in-flight batch: one quick, near-zero-timeout peek per call, not
+  // a blocking wait, so LVGL gets the CPU back between calls instead of once
+  // per SCAN_WAIT. Several loop() passes share the same budget a single
+  // blocking call used to spend alone.
+  uint32_t found = 0;
+  if (scan_batch_count_ > 0) {
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    for (int i = 0; i < scan_batch_count_; i++)
+      FD_SET(scan_batch_fds_[i], &wfds);
+    struct timeval sel {};
+    sel.tv_sec = 0;
+    sel.tv_usec = 2000;  // a peek, not a wait
+    if (::select(scan_batch_maxfd_ + 1, nullptr, &wfds, nullptr, &sel) > 0) {
+      for (int i = 0; i < scan_batch_count_; i++) {
+        if (!FD_ISSET(scan_batch_fds_[i], &wfds))
           continue;
         int err = 0;
         socklen_t len = sizeof(err);
-        ::getsockopt(fds[i], SOL_SOCKET, SO_ERROR, &err, &len);
+        ::getsockopt(scan_batch_fds_[i], SOL_SOCKET, SO_ERROR, &err, &len);
         if (err == 0) {
-          found = addrs[i];
+          found = scan_batch_addrs_[i];
           break;
         }
       }
     }
-    for (int i = 0; i < count; i++)
-      ::close(fds[i]);
   }
+
+  if (found == 0 && millis() < scan_batch_deadline_)
+    return false;  // still waiting on this batch; poll again next pass
+
+  for (int i = 0; i < scan_batch_count_; i++)
+    ::close(scan_batch_fds_[i]);
+  scan_batch_open_ = false;
 
   // One line per batch, so a sweep that is not actually sweeping is visible
   // immediately rather than after ten minutes of silence.
@@ -574,8 +587,9 @@ bool SolarmanMinimal::tcp_scan_step() {
   // sweeping, and a config at INFO would have the DEBUG version stripped at
   // compile time - leaving a silent scan that looks identical to a broken one.
   ESP_LOGI(TAG, "scan: .%u-.%u  %d open attempts, %d refused at once, %u ms%s",
-           (unsigned) first, (unsigned) (scan_next_ - 1), count, refused,
-           (unsigned) (millis() - began), found != 0 ? "  HIT" : "");
+           (unsigned) scan_batch_first_, (unsigned) (scan_next_ - 1),
+           scan_batch_count_, scan_batch_refused_,
+           (unsigned) (millis() - scan_batch_began_), found != 0 ? "  HIT" : "");
 
   if (scan_next_ >= 255) {
     scan_next_ = 1;
@@ -592,6 +606,10 @@ bool SolarmanMinimal::tcp_scan_step() {
   inet_ntop(AF_INET, &found, a, sizeof(a));
   ESP_LOGI(TAG, "scan: port %u open at %s - checking whether it speaks V5",
            SOLARMAN_PORT, a);
+  // verify_candidate() still blocks - up to a few seconds, occasionally
+  // several times over if this turns out not to be a real logger - but it
+  // runs once per open port found, not once per batch of the whole sweep, so
+  // it is a rare, bounded stall rather than the systemic one above.
   if (verify_candidate(found))
     return true;
   // Something else lives on 8899 here. Say so and keep going: silence would

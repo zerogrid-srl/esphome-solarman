@@ -246,6 +246,24 @@ class SolarmanMinimal : public PollingComponent {
   uint32_t scan_saved_serial_{0};
   uint8_t scan_next_{1};       // host octet to try next, 1..254
   bool scan_wrapped_{false};   // a full sweep has completed without a find
+
+  // One batch's worth of state, carried across loop() calls instead of
+  // living on the stack of one call. Letting a single call block until every
+  // connect() in the batch resolves - up to SCAN_WAIT - starved LVGL of the
+  // CPU for that whole stretch, every batch, for the entire sweep: a touch
+  // during a scan was read late enough to look like a drag instead of a tap,
+  // which the tileview's gesture detector took as a swipe. Spreading the same
+  // SCAN_WAIT budget across many quick polls, a couple of milliseconds each,
+  // fixes that without changing how long the sweep takes.
+  bool scan_batch_open_{false};
+  int scan_batch_fds_[SCAN_PARALLEL];
+  uint32_t scan_batch_addrs_[SCAN_PARALLEL];
+  int scan_batch_count_{0};
+  int scan_batch_maxfd_{-1};
+  int scan_batch_refused_{0};
+  uint32_t scan_batch_deadline_{0};
+  uint32_t scan_batch_began_{0};
+  uint8_t scan_batch_first_{1};
   ESPPreferenceObject prefs_;
   ESPPreferenceObject serial_prefs_;
 
